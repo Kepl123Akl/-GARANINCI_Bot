@@ -1,139 +1,468 @@
-import telebot
-import datetime
 import os
+import datetime
+import telebot
+from telebot import types
 from dotenv import load_dotenv
+from zoneinfo import ZoneInfo
 
-# ==================== НАСТРОЙКИ ====================
+# ==================================================
+# НАСТРОЙКИ
+# ==================================================
+
 load_dotenv()
 
-bot = telebot.TeleBot(os.getenv("TOKEN"))
+TOKEN = os.getenv("TOKEN")
 
-# Список всех записанных людей
-booked_users = {}
+if not TOKEN:
+    raise ValueError("TOKEN не найден!")
 
-# Записанные даты (calendar.id: (Имя, chat_id))
-calendar = {}
+bot = telebot.TeleBot(TOKEN)
 
-# ================================================
+# Часовой пояс
+TIMEZONE = ZoneInfo("Asia/Yekaterinburg")
 
-def is_working_time():
-    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=3)))
-    start = now.replace(hour=8, minute=0, second=0, microsecond=0)
-    end = now.replace(hour=20, minute=0, second=0, microsecond=0)
-    return start <= now <= end
+# Рабочее время аудитории
+START_HOUR = 8
+END_HOUR = 20
 
+# Брони:
+# ключ = дата + время
+# значение = информация о брони
+bookings = {}
 
-@bot.message_handler(commands=['start'])
-def start(message):
-    bot.send_message(
-        message.chat.id,
-        f"👋 Привет, {message.from_user.first_name}!\n\n"
-        "Я бот для бронирования аудитории.\n"
-        "Пиши /book — и я покажу кнопки с временем."
-    )
+# Пользователи, которые сейчас вводят имя
+waiting_for_name = {}
 
+# ==================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ==================================================
 
-@bot.message_handler(commands=['book'])
-def book(message):
-    if not is_working_time():
-        bot.send_message(message.chat.id, "❌ Запись недоступна: время за пределами 8:00–20:00.")
-        return
-
-    bot.send_message(message.chat.id, "📝 Напиши своё имя (например: Иван Иванов):")
-    bot.register_next_step_handler(message, get_name)
+def now():
+    return datetime.datetime.now(TIMEZONE)
 
 
-def get_name(message):
-    name = message.text.strip()
-    booked_users[message.chat.id] = name
+def get_today():
+    return now().date()
 
-    keyboard = telebot.types.InlineKeyboardMarkup(row_width=3)
-    times = ["08:00", "09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00", "19:00"]
-    buttons = [telebot.types.InlineKeyboardButton(text=t, callback_data=f"book_{t}") for t in times]
+
+def make_booking_key(date, hour):
+    return f"{date.isoformat()}_{hour:02d}:00"
+
+
+def format_time(hour):
+    return f"{hour:02d}:00"
+
+
+def create_keyboard(date):
+    """
+    Создаёт кнопки времени.
+    Уже занятые времена не показываются.
+    """
+
+    keyboard = types.InlineKeyboardMarkup(row_width=3)
+
+    buttons = []
+
+    for hour in range(START_HOUR, END_HOUR):
+        key = make_booking_key(date, hour)
+
+        # Если время уже занято — кнопку не создаём
+        if key in bookings:
+            continue
+
+        button = types.InlineKeyboardButton(
+            text=format_time(hour),
+            callback_data=f"book:{date.isoformat()}:{hour}"
+        )
+
+        buttons.append(button)
 
     for i in range(0, len(buttons), 3):
-        keyboard.add(*buttons[i:i+3])
+        keyboard.add(*buttons[i:i + 3])
+
+    return keyboard
+
+
+def send_booking_menu(chat_id):
+    date = get_today()
+
+    keyboard = create_keyboard(date)
+
+    if not keyboard.keyboard:
+        bot.send_message(
+            chat_id,
+            "❌ На сегодня свободных времён нет."
+        )
+        return
 
     bot.send_message(
-        message.chat.id,
-        "📅 Выбери время (каждое окно — 1 час):\nС 08:00 до 19:00",
+        chat_id,
+        "📅 <b>Бронирование аудитории</b>\n\n"
+        f"Дата: {date.strftime('%d.%m.%Y')}\n"
+        "Доступное время: с 08:00 до 20:00.\n\n"
+        "Выберите свободное время:",
+        parse_mode="HTML",
         reply_markup=keyboard
     )
 
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("book_"))
-def handle_time_selection(call):
-    time_str = call.data.split("_")[1]
-    dt = datetime.datetime.strptime(time_str, "%H:%M").replace(
-        year=datetime.datetime.now().year,
-        month=datetime.datetime.now().month,
-        day=datetime.datetime.now().day
-    )
-    calendar_id = dt.timestamp()
+# ==================================================
+# /START
+# ==================================================
 
-    if calendar_id in calendar:
-        bot.answer_callback_query(call.id, "❌ Эта дата уже занята!", show_alert=True)
+@bot.message_handler(commands=["start"])
+def start(message):
+
+    bot.send_message(
+        message.chat.id,
+        f"👋 Привет, {message.from_user.first_name}!\n\n"
+        "Я бот для бронирования аудитории.\n\n"
+        "/book — забронировать аудиторию\n"
+        "/rv — показать все записи\n"
+        "/delete — отменить все записи"
+    )
+
+
+# ==================================================
+# /BOOK
+# ==================================================
+
+@bot.message_handler(commands=["book"])
+def book(message):
+
+    user_id = message.from_user.id
+
+    waiting_for_name[user_id] = {
+        "chat_id": message.chat.id
+    }
+
+    bot.send_message(
+        message.chat.id,
+        "📝 Напишите ваше имя:"
+    )
+
+    bot.register_next_step_handler(message, get_name)
+
+
+# ==================================================
+# ПОЛУЧЕНИЕ ИМЕНИ
+# ==================================================
+
+def get_name(message):
+
+    user_id = message.from_user.id
+
+    if not message.text:
+        bot.send_message(
+            message.chat.id,
+            "❌ Напишите имя текстом."
+        )
         return
 
-    calendar[calendar_id] = (booked_users.get(call.from_user.id, "Неизвестно"), call.from_user.id)
+    name = message.text.strip()
 
-    # === Сообщение ВСЕМ участникам чата ===
-    busy_start = dt
-    busy_end = dt + datetime.timedelta(hours=1)
-    busy_text = f"🔴 <b>АУДИТОРИЯ ЗАНЯТА!</b>\n\n🔹 С {busy_start.strftime('%H:%M')} до {busy_end.strftime('%H:%M')} идёт репетиция.\n✅ Не подходите к дверям."
+    if not name:
+        bot.send_message(
+            message.chat.id,
+            "❌ Имя не может быть пустым."
+        )
+        return
+
+    waiting_for_name[user_id] = {
+        "chat_id": message.chat.id,
+        "name": name
+    }
+
+    send_booking_menu(message.chat.id)
+
+
+# ==================================================
+# ВЫБОР ВРЕМЕНИ
+# ==================================================
+
+@bot.callback_query_handler(
+    func=lambda call: call.data.startswith("book:")
+)
+def choose_time(call):
+
+    user_id = call.from_user.id
+
+    if user_id not in waiting_for_name:
+        bot.answer_callback_query(
+            call.id,
+            "Сначала напишите /book",
+            show_alert=True
+        )
+        return
+
     try:
-        bot.send_message(call.message.chat.id, busy_text, parse_mode="HTML")
+        _, date_string, hour_string = call.data.split(":")
+
+        date = datetime.date.fromisoformat(date_string)
+        hour = int(hour_string)
+
+    except Exception:
+        bot.answer_callback_query(
+            call.id,
+            "Ошибка времени.",
+            show_alert=True
+        )
+        return
+
+    key = make_booking_key(date, hour)
+
+    # ==============================================
+    # ПРОВЕРКА — НЕ ЗАНЯТО ЛИ ВРЕМЯ
+    # ==============================================
+
+    if key in bookings:
+
+        bot.answer_callback_query(
+            call.id,
+            "❌ Это время уже занято!",
+            show_alert=True
+        )
+
+        # Обновляем кнопки
+        try:
+            bot.edit_message_reply_markup(
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=create_keyboard(date)
+            )
+        except Exception:
+            pass
+
+        return
+
+    user_data = waiting_for_name[user_id]
+
+    name = user_data["name"]
+    chat_id = user_data["chat_id"]
+
+    # ==============================================
+    # СОЗДАЁМ БРОНЬ
+    # ==============================================
+
+    bookings[key] = {
+        "name": name,
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "date": date,
+        "hour": hour
+    }
+
+    # ==============================================
+    # КНОПКА ПРОПАДАЕТ
+    # ==============================================
+
+    try:
+        bot.edit_message_reply_markup(
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=create_keyboard(date)
+        )
     except Exception:
         pass
 
-    bot.answer_callback_query(call.id, "✅ Запись подтверждена!")
-    bot.edit_message_text(
-        f"✅ Запись подтверждена!\n\nИмя: {calendar[calendar_id][0]}\nДата: {dt.strftime('%d.%m.%Y %H:%M')}\n\n🗓️ Календарь обновлён — это время теперь недоступно.",
-        call.message.chat.id,
-        call.message.message_id
+    # ==============================================
+    # ПОДТВЕРЖДЕНИЕ
+    # ==============================================
+
+    end_hour = hour + 1
+
+    confirmation = (
+        "✅ <b>Запись подтверждена!</b>\n\n"
+        f"👤 Имя: {name}\n"
+        f"📅 Дата: {date.strftime('%d.%m.%Y')}\n"
+        f"⏰ Время: {hour:02d}:00–{end_hour:02d}:00\n\n"
+        "🔴 Это время теперь занято."
+    )
+
+    bot.answer_callback_query(
+        call.id,
+        "✅ Запись подтверждена!"
+    )
+
+    try:
+        bot.edit_message_text(
+            confirmation,
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="HTML"
+        )
+    except Exception:
+
+        bot.send_message(
+            chat_id,
+            confirmation,
+            parse_mode="HTML"
+        )
+
+    # ==============================================
+    # СООБЩЕНИЕ В ГРУППУ
+    # ==============================================
+
+    group_message = (
+        "🔴 <b>АУДИТОРИЯ ЗАНЯТА!</b>\n\n"
+        f"👤 {name}\n"
+        f"⏰ {hour:02d}:00–{end_hour:02d}:00\n"
+        f"📅 {date.strftime('%d.%m.%Y')}\n\n"
+        "Не занимайте это время."
+    )
+
+    try:
+        bot.send_message(
+            call.message.chat.id,
+            group_message,
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+
+# ==================================================
+# /RV
+# ==================================================
+
+@bot.message_handler(commands=["rv"])
+def reservations(message):
+
+    if not bookings:
+
+        bot.send_message(
+            message.chat.id,
+            "📭 Пока нет ни одной записи."
+        )
+
+        return
+
+    text = "📢 <b>СПИСОК БРОНИРОВАНИЙ</b>\n\n"
+
+    for key, booking in sorted(bookings.items()):
+
+        date = booking["date"]
+        hour = booking["hour"]
+        name = booking["name"]
+
+        text += (
+            f"👤 {name}\n"
+            f"📅 {date.strftime('%d.%m.%Y')}\n"
+            f"⏰ {hour:02d}:00–{hour + 1:02d}:00\n\n"
+        )
+
+    text += "━━━━━━━━━━━━━━\n"
+    text += "📢 Список бронирований."
+
+    # ==============================================
+    # ОТПРАВЛЯЕМ ВСЕМ, КТО БРОНИРОВАЛ
+    # ==============================================
+
+    sent = set()
+
+    for booking in bookings.values():
+
+        chat_id = booking["chat_id"]
+
+        if chat_id in sent:
+            continue
+
+        sent.add(chat_id)
+
+        try:
+
+            bot.send_message(
+                chat_id,
+                text,
+                parse_mode="HTML"
+            )
+
+        except Exception:
+            pass
+
+    # Также отправляем в текущую группу/чат
+    try:
+
+        bot.send_message(
+            message.chat.id,
+            text,
+            parse_mode="HTML"
+        )
+
+    except Exception:
+        pass
+
+
+# ==================================================
+# /DELETE
+# ==================================================
+
+@bot.message_handler(commands=["delete"])
+def delete_all(message):
+
+    if not bookings:
+
+        bot.send_message(
+            message.chat.id,
+            "📭 Нет записей для отмены."
+        )
+
+        return
+
+    # Уведомляем всех записанных
+    sent = set()
+
+    for booking in bookings.values():
+
+        chat_id = booking["chat_id"]
+
+        if chat_id in sent:
+            continue
+
+        sent.add(chat_id)
+
+        date = booking["date"]
+        hour = booking["hour"]
+
+        try:
+
+            bot.send_message(
+                chat_id,
+                "❌ <b>Ваша запись отменена.</b>\n\n"
+                f"📅 {date.strftime('%d.%m.%Y')}\n"
+                f"⏰ {hour:02d}:00–{hour + 1:02d}:00",
+                parse_mode="HTML"
+            )
+
+        except Exception:
+            pass
+
+    # Полностью очищаем бронирования
+    bookings.clear()
+    waiting_for_name.clear()
+
+    bot.send_message(
+        message.chat.id,
+        "✅ <b>Все записи отменены.</b>\n\n"
+        "Все временные интервалы снова доступны.",
+        parse_mode="HTML"
     )
 
 
-@bot.message_handler(commands=['rv'])
-def send_rv(message):
-    if not calendar:
-        bot.send_message(message.chat.id, "📭 Пока никто ничего не забронировал.")
-        return
-
-    text = "📢 <b>Список всех бронирований</b>\n\n"
-    for ts, (name, chat_id) in calendar.items():
-        dt = datetime.datetime.fromtimestamp(ts)
-        text += f"• {name} — {dt.strftime('%d.%m.%Y %H:%M')}\n"
-
-    text += "\n<b>Все записи отправлены в личные чаты!</b>"
-
-    for chat_id in list(calendar.values()):
-        try:
-            bot.send_message(chat_id[1], text, parse_mode="HTML")
-        except Exception:
-            pass
-
-    bot.send_message(message.chat.id, "✅ Сообщение с полным списком отправлено всем!")
-
-
-@bot.message_handler(commands=['delete'])
-def delete_all(message):
-    if not calendar:
-        bot.send_message(message.chat.id, "📭 Нет записей для отмены.")
-        return
-
-    for ts, (_, chat_id) in calendar.items():
-        try:
-            dt = datetime.datetime.fromtimestamp(ts)
-            bot.send_message(chat_id, f"❌ Ваша запись на {dt.strftime('%d.%m.%Y %H:%M')} была отменена администратором.")
-        except Exception:
-            pass
-
-    calendar.clear()
-    booked_users.clear()
-    bot.send_message(message.chat.id, "✅ Все записи успешно отменены.")
-
+# ==================================================
+# ЗАПУСК
+# ==================================================
 
 if __name__ == "__main__":
-    print("✅ Бот запущен и работает в группах и каналах!")
-    bot.polling(none_stop=True)
+
+    print("================================")
+    print("🤖 БОТ ЗАПУЩЕН")
+    print("🕐 Время: 08:00–20:00")
+    print("📅 Бронирование доступно 24/7")
+    print("================================")
+
+    bot.infinity_polling(
+        skip_pending=True,
+        timeout=30,
+        long_polling_timeout=30
+    )
