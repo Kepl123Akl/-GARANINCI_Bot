@@ -5,7 +5,6 @@ import os
 import sqlite3
 import uuid
 from datetime import datetime, timedelta
-from typing import Optional
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -27,56 +26,39 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 # НАСТРОЙКИ
 # =========================================================
 
-def get_env(name, default=None):
-    value = os.getenv(name)
-    return value if value else default
-
-
-# Токен бота
 BOT_TOKEN = (
-    get_env("BOT_TOKEN")
-    or get_env("TOKEN")
-    or get_env("API_TOKEN")
+    os.getenv("BOT_TOKEN")
+    or os.getenv("TOKEN")
+    or os.getenv("API_TOKEN")
 )
 
-# Твой Telegram username.
-# Например: VinnitSSki
-ADMIN_USERNAME = get_env(
-    "ADMIN_USERNAME",
-    "VinnitSSki"
-)
+# ТВОЙ TELEGRAM ID
+ADMIN_USER_ID = 8421476708
 
-# Можно указать Telegram ID вместо username.
-# Это необязательно.
-ADMIN_USER_ID = get_env("ADMIN_USER_ID")
-
-# Группа или канал, куда бот будет писать
-# после подтверждения репетиции.
-ANNOUNCEMENT_CHAT_ID = get_env(
-    "ANNOUNCEMENT_CHAT_ID"
-)
+# Сюда позже можно поставить ID группы/канала.
+# Например:
+# ANNOUNCEMENT_CHAT_ID = -1001234567890
+#
+# Пока оставляем None.
+ANNOUNCEMENT_CHAT_ID = None
 
 # Часовой пояс
-TIMEZONE_NAME = get_env(
+TIMEZONE_NAME = os.getenv(
     "TIMEZONE",
     "Asia/Yekaterinburg"
 )
 
-# На сколько дней вперед разрешено бронирование
-DATE_DAYS_AHEAD = int(
-    get_env("DATE_DAYS_AHEAD", "30")
-)
+# Бронирование на 30 дней вперед
+DATE_DAYS_AHEAD = 30
 
-# Файл базы данных
-DATABASE_PATH = get_env(
-    "DATABASE_PATH",
-    "bookings.db"
-)
+# База данных
+DATABASE_PATH = "bookings.db"
 
 
 if not BOT_TOKEN:
     raise RuntimeError(
-        "Не найден BOT_TOKEN или TOKEN в переменных BotHost."
+        "Не найден BOT_TOKEN. "
+        "Добавь BOT_TOKEN в переменные BotHost."
     )
 
 
@@ -126,7 +108,8 @@ def init_db():
         )
     """)
 
-    # Один активный пользователь на один слот.
+    # Нельзя создать две активные заявки
+    # на одно и то же время.
     conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS active_slot_unique
         ON bookings(booking_date, booking_time)
@@ -224,7 +207,11 @@ def create_booking(
 
     except Exception:
         conn.rollback()
-        logger.exception("Ошибка создания бронирования")
+
+        logger.exception(
+            "Ошибка создания бронирования"
+        )
+
         return None
 
     finally:
@@ -247,7 +234,10 @@ def get_booking(booking_id):
     return row
 
 
-def update_booking_status(booking_id, status):
+def update_booking_status(
+    booking_id,
+    status
+):
     conn = get_db()
 
     conn.execute("""
@@ -299,7 +289,7 @@ def delete_all_active_bookings():
 
 
 # =========================================================
-# КНОПКИ
+# КЛАВИАТУРЫ
 # =========================================================
 
 def date_keyboard():
@@ -310,11 +300,17 @@ def date_keyboard():
 
     for i in range(DATE_DAYS_AHEAD):
 
-        current_date = today + timedelta(days=i)
+        current_date = (
+            today + timedelta(days=i)
+        )
 
         builder.button(
-            text=current_date.strftime("%d.%m.%Y"),
-            callback_data=f"date:{current_date.isoformat()}"
+            text=current_date.strftime(
+                "%d.%m.%Y"
+            ),
+            callback_data=(
+                f"date:{current_date.isoformat()}"
+            )
         )
 
     builder.adjust(2)
@@ -326,11 +322,17 @@ def time_keyboard(booking_date):
 
     builder = InlineKeyboardBuilder()
 
-    # Репетиции с 08:00 до 20:00.
-    # Последний возможный час — 19:00–20:00.
+    # Слоты:
+    # 08:00–09:00
+    # 09:00–10:00
+    # ...
+    # 19:00–20:00
+
     for hour in range(8, 20):
 
-        booking_time = f"{hour:02d}:00"
+        booking_time = (
+            f"{hour:02d}:00"
+        )
 
         if not slot_is_busy(
             booking_date,
@@ -339,7 +341,9 @@ def time_keyboard(booking_date):
 
             builder.button(
                 text=booking_time,
-                callback_data=f"time:{booking_time}"
+                callback_data=(
+                    f"time:{booking_time}"
+                )
             )
 
     builder.adjust(3)
@@ -355,7 +359,9 @@ def people_keyboard():
 
         builder.button(
             text=str(people),
-            callback_data=f"people:{people}"
+            callback_data=(
+                f"people:{people}"
+            )
         )
 
     builder.adjust(5)
@@ -370,11 +376,15 @@ def admin_keyboard(booking_id):
             [
                 InlineKeyboardButton(
                     text="✅ Одобрить",
-                    callback_data=f"approve:{booking_id}"
+                    callback_data=(
+                        f"approve:{booking_id}"
+                    )
                 ),
                 InlineKeyboardButton(
                     text="❌ Отклонить",
-                    callback_data=f"reject:{booking_id}"
+                    callback_data=(
+                        f"reject:{booking_id}"
+                    )
                 )
             ]
         ]
@@ -382,7 +392,7 @@ def admin_keyboard(booking_id):
 
 
 # =========================================================
-# СОСТОЯНИЯ БРОНИРОВАНИЯ
+# СОСТОЯНИЯ
 # =========================================================
 
 class BookingStates(StatesGroup):
@@ -404,35 +414,7 @@ ROUTER = Router()
 
 
 # =========================================================
-# ПРОВЕРКА АДМИНА
-# =========================================================
-
-def is_admin(user):
-
-    if not user:
-        return False
-
-    # Если указан ID — используем его.
-    if ADMIN_USER_ID:
-
-        try:
-            if user.id == int(ADMIN_USER_ID):
-                return True
-        except ValueError:
-            pass
-
-    # Если ID не указан — проверяем username.
-    username = user.username or ""
-
-    return (
-        username.lower()
-        ==
-        ADMIN_USERNAME.lower().lstrip("@")
-    )
-
-
-# =========================================================
-# ТЕКСТ ЗАЯВКИ
+# ФОРМАТ ЗАЯВКИ
 # =========================================================
 
 def booking_text(booking):
@@ -444,7 +426,7 @@ def booking_text(booking):
     )
 
     return (
-        "<b>🎭 Новая заявка на репетицию</b>\n\n"
+        "<b>🎭 НОВАЯ ЗАЯВКА</b>\n\n"
 
         f"📅 <b>Дата:</b> "
         f"{html.escape(booking['booking_date'])}\n"
@@ -470,32 +452,37 @@ def booking_text(booking):
 
 
 # =========================================================
-# ПУБЛИКАЦИЯ В ГРУППУ / КАНАЛ
+# ПУБЛИКАЦИЯ РЕПЕТИЦИИ
 # =========================================================
 
-async def publish_rehearsal(bot, booking):
+async def publish_rehearsal(
+    bot,
+    booking
+):
 
     if not ANNOUNCEMENT_CHAT_ID:
 
-        logger.warning(
-            "ANNOUNCEMENT_CHAT_ID не указан."
+        logger.info(
+            "ANNOUNCEMENT_CHAT_ID не указан. "
+            "Публикация пропущена."
         )
 
-        return False
+        return
 
-    # Время окончания — через 1 час.
     start_hour = int(
-        booking["booking_time"].split(":")[0]
+        booking["booking_time"][:2]
     )
 
     end_hour = start_hour + 1
 
     start_time = booking["booking_time"]
 
-    end_time = f"{end_hour:02d}:00"
+    end_time = (
+        f"{end_hour:02d}:00"
+    )
 
     text = (
-        "📢 <b>РЕПЕТИЦИЯ</b>\n\n"
+        "📢 <b>РЕПЕТИЦИЯ СОСТОИТСЯ</b>\n\n"
 
         f"📅 <b>Дата:</b> "
         f"{html.escape(booking['booking_date'])}\n"
@@ -521,16 +508,12 @@ async def publish_rehearsal(bot, booking):
             "Репетиция опубликована."
         )
 
-        return True
-
     except Exception:
 
         logger.exception(
-            "Не удалось отправить сообщение "
-            "в группу/канал."
+            "Ошибка публикации "
+            "репетиции."
         )
-
-        return False
 
 
 # =========================================================
@@ -557,7 +540,7 @@ async def start(
 
 
 # =========================================================
-# /BOOK
+# BOOK
 # =========================================================
 
 @ROUTER.message(Command("book"))
@@ -683,7 +666,7 @@ async def select_time(
 
 
 # =========================================================
-# КОЛИЧЕСТВО ЛЮДЕЙ
+# ЛЮДИ
 # =========================================================
 
 @ROUTER.callback_query(
@@ -792,7 +775,7 @@ async def enter_contact(
 
 
 # =========================================================
-# ЦЕЛЬ БРОНИРОВАНИЯ
+# СОЗДАНИЕ ЗАЯВКИ
 # =========================================================
 
 @ROUTER.message(
@@ -857,36 +840,36 @@ async def enter_purpose(
         "Ожидайте подтверждения."
     )
 
-    # Теперь заявка отправляется
-    # не в ADMIN_CHAT_ID,
-    # а прямо тебе в личку по user ID,
-    # если ты уже запускал бота.
-    #
-    # Для этого используем ADMIN_USER_ID.
-    if ADMIN_USER_ID:
+    # =====================================================
+    # ОТПРАВЛЯЕМ ЗАЯВКУ ТЕБЕ
+    # =====================================================
 
-        try:
+    try:
 
-            await bot.send_message(
-                chat_id=int(ADMIN_USER_ID),
-                text=booking_text(
-                    booking
-                ),
-                reply_markup=admin_keyboard(
-                    booking_id
-                )
+        await bot.send_message(
+            chat_id=ADMIN_USER_ID,
+            text=booking_text(
+                booking
+            ),
+            reply_markup=admin_keyboard(
+                booking_id
             )
+        )
 
-        except Exception:
+        logger.info(
+            "Заявка отправлена администратору."
+        )
 
-            logger.exception(
-                "Не удалось отправить "
-                "заявку админу."
-            )
+    except Exception:
+
+        logger.exception(
+            "НЕ УДАЛОСЬ отправить заявку "
+            "администратору."
+        )
 
 
 # =========================================================
-# ОДОБРЕНИЕ
+# ОДОБРИТЬ
 # =========================================================
 
 @ROUTER.callback_query(
@@ -897,9 +880,7 @@ async def approve_booking(
     bot: Bot
 ):
 
-    if not is_admin(
-        callback.from_user
-    ):
+    if callback.from_user.id != ADMIN_USER_ID:
 
         await callback.answer(
             "У вас нет прав администратора.",
@@ -944,20 +925,28 @@ async def approve_booking(
         booking_id
     )
 
+    start_hour = int(
+        booking["booking_time"][:2]
+    )
+
+    end_time = (
+        f"{start_hour + 1:02d}:00"
+    )
+
     # Сообщение пользователю
     try:
 
         await bot.send_message(
             chat_id=booking["user_id"],
             text=(
-                "✅ <b>Репетиция подтверждена!</b>\n\n"
+                "✅ <b>РЕПЕТИЦИЯ ПОДТВЕРЖДЕНА!</b>\n\n"
 
                 f"📅 <b>Дата:</b> "
                 f"{booking['booking_date']}\n"
 
                 f"⏰ <b>Время:</b> "
                 f"{booking['booking_time']}–"
-                f"{int(booking['booking_time'][:2]) + 1:02d}:00\n"
+                f"{end_time}\n"
 
                 f"👥 <b>Людей:</b> "
                 f"{booking['people']}"
@@ -970,7 +959,7 @@ async def approve_booking(
             "Не удалось уведомить пользователя."
         )
 
-    # Публикация в группу / канал
+    # Пишем в группу/канал
     await publish_rehearsal(
         bot,
         booking
@@ -986,12 +975,12 @@ async def approve_booking(
     )
 
     await callback.answer(
-        "Бронирование одобрено."
+        "Репетиция подтверждена."
     )
 
 
 # =========================================================
-# ОТКЛОНЕНИЕ
+# ОТКЛОНИТЬ
 # =========================================================
 
 @ROUTER.callback_query(
@@ -1002,9 +991,7 @@ async def reject_booking(
     bot: Bot
 ):
 
-    if not is_admin(
-        callback.from_user
-    ):
+    if callback.from_user.id != ADMIN_USER_ID:
 
         await callback.answer(
             "У вас нет прав администратора.",
@@ -1050,7 +1037,7 @@ async def reject_booking(
         await bot.send_message(
             chat_id=booking["user_id"],
             text=(
-                "❌ <b>Бронирование отклонено.</b>\n\n"
+                "❌ <b>Репетиция отклонена.</b>\n\n"
 
                 f"📅 {booking['booking_date']}\n"
                 f"⏰ {booking['booking_time']}"
@@ -1073,7 +1060,7 @@ async def reject_booking(
     )
 
     await callback.answer(
-        "Бронирование отклонено."
+        "Заявка отклонена."
     )
 
 
@@ -1083,13 +1070,10 @@ async def reject_booking(
 
 @ROUTER.message(Command("rv"))
 async def rv_command(
-    message: Message,
-    bot: Bot
+    message: Message
 ):
 
-    if not is_admin(
-        message.from_user
-    ):
+    if message.from_user.id != ADMIN_USER_ID:
 
         await message.answer(
             "❌ У вас нет прав."
@@ -1108,7 +1092,7 @@ async def rv_command(
         return
 
     lines = [
-        "📋 <b>Текущие репетиции</b>\n"
+        "📋 <b>ТЕКУЩИЕ РЕПЕТИЦИИ</b>\n"
     ]
 
     for booking in bookings:
@@ -1117,7 +1101,9 @@ async def rv_command(
             booking["booking_time"][:2]
         )
 
-        end_time = f"{hour + 1:02d}:00"
+        end_time = (
+            f"{hour + 1:02d}:00"
+        )
 
         lines.append(
             f"📅 {booking['booking_date']} "
@@ -1126,10 +1112,8 @@ async def rv_command(
             f"— {booking['people']} чел."
         )
 
-    text = "\n".join(lines)
-
     await message.answer(
-        text
+        "\n".join(lines)
     )
 
 
@@ -1143,9 +1127,7 @@ async def delete_command(
     bot: Bot
 ):
 
-    if not is_admin(
-        message.from_user
-    ):
+    if message.from_user.id != ADMIN_USER_ID:
 
         await message.answer(
             "❌ У вас нет прав."
@@ -1177,15 +1159,14 @@ async def delete_command(
                 text=(
                     "⚠️ <b>Внимание</b>\n\n"
                     "Все активные бронирования "
-                    "были отменены."
+                    "были отменены администратором."
                 )
             )
 
         except Exception:
 
             logger.warning(
-                "Не удалось уведомить "
-                "пользователя %s",
+                "Не удалось уведомить %s",
                 user_id
             )
 
@@ -1213,7 +1194,7 @@ async def cancel_command(
 
 
 # =========================================================
-# ЗАПУСК
+# ЗАПУСК БОТА
 # =========================================================
 
 async def main():
@@ -1234,7 +1215,20 @@ async def main():
     )
 
     logger.info(
+        "================================"
+    )
+
+    logger.info(
         "Бот запущен."
+    )
+
+    logger.info(
+        "Администратор: %s",
+        ADMIN_USER_ID
+    )
+
+    logger.info(
+        "================================"
     )
 
     try:
