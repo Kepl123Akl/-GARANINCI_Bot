@@ -1,1002 +1,661 @@
+"""
+Telegram-бот для бронирования театральной аудитории «Гаранинцы».
+Стек: Python 3, aiogram 3.x, SQLite, asyncio.
+Рассчитан на запуск на BotHost командой: python main.py
+"""
 import asyncio
-import html
 import logging
 import os
 import sqlite3
-import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
-from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
+from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (
-CallbackQuery,
-InlineKeyboardButton,
-InlineKeyboardMarkup,
-Message,
-)
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-# =========================================================
-# НАСТРОЙКИ
-# =========================================================
-BOT_TOKEN = (
-os.getenv("BOT_TOKEN")
-or os.getenv("TOKEN")
-or os.getenv("API_TOKEN")
-)
-# Твой Telegram ID (главный админ / создатель)
-ADMIN_USER_ID = 8421476708
-# Юзернейм второго админа (создатель/владелец).
-# Бот сам определит его user_id, как только он один раз
-# напишет боту что угодно (например /start).
-# Указывать БЕЗ символа "@".
-ADMIN_USERNAME = "VinnitSSki"
-# Сюда можно поставить ID группы/канала для публикации
-# объявлений о репетициях. Если не задано (None) —
-# объявление всё равно уйдёт лично всем админам.
-ANNOUNCEMENT_CHAT_ID = None
-# Часовой пояс
-TIMEZONE_NAME = os.getenv(
-"TIMEZONE",
-"Asia/Yekaterinburg"
-)
-# Бронирование на 30 дней вперед
-DATE_DAYS_AHEAD = 30
-# База данных
-DATABASE_PATH = "bookings.db"
-if not BOT_TOKEN:
-raise RuntimeError(
-"Не найден BOT_TOKEN. "
-"Добавь BOT_TOKEN в переменные BotHost."
-)
-TIMEZONE = ZoneInfo(TIMEZONE_NAME)
+# ======================================================================
+# КОНФИГУРАЦИЯ
+# ======================================================================
 logging.basicConfig(
 level=logging.INFO,
-format="%(asctime)s | %(levelname)s | %(message)s"
+format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger(__name__)
-# =========================================================
-# БАЗА ДАННЫХ
-# =========================================================
-def get_db():
-conn = sqlite3.connect(
-DATABASE_PATH,
-timeout=30,
-check_same_thread=False
+logger = logging.getLogger("garaninsty_bot")
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TOKEN")
+if not BOT_TOKEN:
+raise RuntimeError(
+"Не найден токен бота. Задайте переменную окружения BOT_TOKEN "
+"(или TOKEN) в настройках BotHost."
 )
+# Главный администратор — определён прямо в коде, отдельная переменная
+# ADMIN_CHAT_ID в BotHost не требуется.
+ADMIN_USER_ID = 8421476708
+ADMIN_USERNAME = "VinnitSSki"
+# Необязательная настройка — публикация подтверждённых репетиций
+# в группу/канал. Если не задана, бот работает и без неё.
+_raw_announcement_chat_id = os.getenv("ANNOUNCEMENT_CHAT_ID")
+ANNOUNCEMENT_CHAT_ID: int | None = None
+if _raw_announcement_chat_id:
+try:
+ANNOUNCEMENT_CHAT_ID = int(_raw_announcement_chat_id)
+except ValueError:
+logger.warning(
+"ANNOUNCEMENT_CHAT_ID указан некорректно (%s), публикация отключена.",
+_raw_announcement_chat_id,
+)
+TIMEZONE = ZoneInfo("Asia/Yekaterinburg")
+DB_PATH = "bookings.db"
+DAYS_AHEAD = 30
+OPEN_HOUR = 8
+MAX_PEOPLE = 24
+CLOSE_HOUR = 20 # аудитория доступна до 20:00, последний слот 19:00–20:00
+WEEKDAYS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+MONTHS_RU = [
+"", "января", "февраля", "марта", "апреля", "мая", "июня",
+"июля", "августа", "сентября", "октября", "ноября", "декабря",
+]
+def now_local() -> datetime:
+return datetime.now(TIMEZONE)
+def today_local() -> date:
+return now_local().date()
+def format_date_button(d: date) -> str:
+return f"{d.day:02d}.{d.month:02d} ({WEEKDAYS_RU[d.weekday()]})"
+def format_date_human(d: date) -> str:
+return f"{d.day:02d}.{d.month:02d}.{d.year}"
+def parse_iso_date(value: str) -> date:
+return datetime.strptime(value, "%Y-%m-%d").date()
+def slot_id(hour: int) -> str:
+return f"{hour:02d}:00"
+def slot_label(hour: int) -> str:
+return f"{hour:02d}:00–{hour + 1:02d}:00"
+def slot_hour(slot: str) -> int:
+return int(slot.split(":")[0])
+ACTIVE_STATUSES = ("pending", "approved")
+# ======================================================================
+# БАЗА ДАННЫХ (SQLite)
+# ======================================================================
+def _get_connection() -> sqlite3.Connection:
+conn = sqlite3.connect(DB_PATH, timeout=10)
 conn.row_factory = sqlite3.Row
+conn.execute("PRAGMA journal_mode=WAL;")
+conn.execute("PRAGMA foreign_keys=ON;")
 return conn
-def init_db():
-conn = get_db()
-conn.execute("""
+def _init_db_sync() -> None:
+conn = _get_connection()
+try:
+conn.execute(
+"""
 CREATE TABLE IF NOT EXISTS bookings (
-id TEXT PRIMARY KEY,
+id INTEGER PRIMARY KEY AUTOINCREMENT,
 user_id INTEGER NOT NULL,
 username TEXT,
 name TEXT NOT NULL,
 booking_date TEXT NOT NULL,
-booking_time TEXT NOT NULL,
+time_slot TEXT NOT NULL,
 people INTEGER NOT NULL,
 contact TEXT NOT NULL,
 purpose TEXT NOT NULL,
 status TEXT NOT NULL DEFAULT 'pending',
 created_at TEXT NOT NULL
-)
-""")
-# Нельзя создать две активные заявки
-# на одно и то же время.
-conn.execute("""
-CREATE UNIQUE INDEX IF NOT EXISTS active_slot_unique
-ON bookings(booking_date, booking_time)
-WHERE status IN ('pending', 'approved')
-""")
-# Динамический список админов (по ID).
-# Изначально содержит ADMIN_USER_ID.
-# Пользователь с username == ADMIN_USERNAME
-# добавляется сюда автоматически при первом
-# обращении к боту.
-conn.execute("""
-CREATE TABLE IF NOT EXISTS admins (
-user_id INTEGER PRIMARY KEY,
-username TEXT
-)
-""")
-conn.execute("""
-INSERT OR IGNORE INTO admins (user_id, username)
-VALUES (?, NULL)
-""", (ADMIN_USER_ID,))
-conn.commit()
-conn.close()
-def register_admin_if_needed(user):
+);
 """
-Если пишущий боту пользователь имеет username,
-совпадающий с ADMIN_USERNAME, добавляем/обновляем
-его user_id в таблице admins.
+)
+# Партиционный уникальный индекс — защита от двойного бронирования.
+# Одновременная вставка двух заявок на одно и то же дата+время
+# со статусом pending/approved физически невозможна благодаря
+# этому ограничению на уровне SQLite.
+conn.execute(
 """
-if not user or not user.username:
-return
-if user.username.lower() != ADMIN_USERNAME.lower():
-return
-conn = get_db()
-conn.execute("""
-INSERT INTO admins (user_id, username)
-VALUES (?, ?)
-ON CONFLICT(user_id) DO UPDATE SET username = excluded.username
-""", (user.id, user.username))
+CREATE UNIQUE INDEX IF NOT EXISTS idx_active_slot
+ON bookings(booking_date, time_slot)
+WHERE status IN ('pending', 'approved');
+"""
+)
 conn.commit()
+finally:
 conn.close()
-def is_admin(user_id):
-conn = get_db()
-row = conn.execute("""
-SELECT 1 FROM admins WHERE user_id = ?
-""", (user_id,)).fetchone()
-conn.close()
-return row is not None
-def get_admin_ids():
-conn = get_db()
-rows = conn.execute("""
-SELECT user_id FROM admins
-""").fetchall()
-conn.close()
-return [row["user_id"] for row in rows]
-def slot_is_busy(booking_date, booking_time):
-conn = get_db()
-row = conn.execute("""
-SELECT id
-FROM bookings
-WHERE booking_date = ?
-AND booking_time = ?
-AND status IN ('pending', 'approved')
-LIMIT 1
-""", (
-booking_date,
-booking_time
-)).fetchone()
-conn.close()
-return row is not None
-def create_booking(
-user_id,
-username,
-name,
-booking_date,
-booking_time,
-people,
-contact,
-purpose
-):
-booking_id = str(uuid.uuid4())
-conn = get_db()
+def _get_occupied_slots_sync(booking_date: str) -> set:
+conn = _get_connection()
 try:
-conn.execute("BEGIN IMMEDIATE")
-busy = conn.execute("""
-SELECT id
-FROM bookings
-WHERE booking_date = ?
-AND booking_time = ?
-AND status IN ('pending', 'approved')
-LIMIT 1
-""", (
-booking_date,
-booking_time
-)).fetchone()
-if busy:
-conn.rollback()
-return None
-conn.execute("""
-INSERT INTO bookings (
-id,
+rows = conn.execute(
+"""
+SELECT time_slot FROM bookings
+WHERE booking_date = ? AND status IN ('pending', 'approved');
+""",
+(booking_date,),
+).fetchall()
+return {row["time_slot"] for row in rows}
+finally:
+conn.close()
+def _create_booking_sync(
+user_id: int,
+username: str | None,
+name: str,
+booking_date: str,
+time_slot: str,
+people: int,
+contact: str,
+purpose: str,
+) -> int | None:
+"""Возвращает id созданной заявки, либо None, если слот уже занят."""
+conn = _get_connection()
+try:
+created_at = now_local().strftime("%Y-%m-%d %H:%M:%S")
+cur = conn.execute(
+"""
+INSERT INTO bookings
+(user_id, username, name, booking_date, time_slot,
+people, contact, purpose, status, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?);
+""",
+(
 user_id,
 username,
 name,
 booking_date,
-booking_time,
+time_slot,
 people,
 contact,
 purpose,
-status,
-created_at
+created_at,
+),
 )
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-""", (
-booking_id,
-user_id,
-username,
-name,
-booking_date,
-booking_time,
-people,
-contact,
-purpose,
-datetime.now(TIMEZONE).isoformat()
-))
 conn.commit()
-return booking_id
-except Exception:
-conn.rollback()
-logger.exception(
-"Ошибка создания бронирования"
-)
+return cur.lastrowid
+except sqlite3.IntegrityError:
+# Слот уже занят другой активной заявкой (pending/approved).
 return None
 finally:
 conn.close()
-def get_booking(booking_id):
-conn = get_db()
-row = conn.execute("""
-SELECT *
-FROM bookings
-WHERE id = ?
-""", (
-booking_id,
-)).fetchone()
+def _get_booking_sync(booking_id: int) -> sqlite3.Row | None:
+conn = _get_connection()
+try:
+return conn.execute(
+).fetchone()
+finally:
 conn.close()
-return row
-def update_booking_status(
-booking_id,
-status
-):
-conn = get_db()
-conn.execute("""
-UPDATE bookings
-SET status = ?
-WHERE id = ?
-""", (
-status,
-booking_id
-))
+"SELECT * FROM bookings WHERE id = ?;", (booking_id,)
+def _update_status_sync(booking_id: int, status: str) -> None:
+conn = _get_connection()
+try:
+conn.execute(
+"UPDATE bookings SET status = ? WHERE id = ?;", (status, booking_id)
+)
 conn.commit()
+finally:
 conn.close()
-def get_all_active_bookings():
-conn = get_db()
-rows = conn.execute("""
-SELECT *
-FROM bookings
+def _get_active_bookings_sync() -> list:
+conn = _get_connection()
+try:
+rows = conn.execute(
+"""
+SELECT * FROM bookings
 WHERE status IN ('pending', 'approved')
-ORDER BY booking_date, booking_time
-""").fetchall()
+ORDER BY booking_date ASC, time_slot ASC;
+"""
+).fetchall()
+return list(rows)
+finally:
 conn.close()
-return rows
-def delete_all_active_bookings():
-conn = get_db()
-rows = conn.execute("""
-SELECT *
-FROM bookings
-WHERE status IN ('pending', 'approved')
-""").fetchall()
-conn.execute("""
-DELETE FROM bookings
-WHERE status IN ('pending', 'approved')
-""")
-conn.commit()
-conn.close()
-return rows
-# =========================================================
-# КЛАВИАТУРЫ
-# =========================================================
-def date_keyboard():
-builder = InlineKeyboardBuilder()
-today = datetime.now(TIMEZONE).date()
-for i in range(DATE_DAYS_AHEAD):
-current_date = (
-today + timedelta(days=i)
-)
-builder.button(
-text=current_date.strftime(
-"%d.%m.%Y"
-callback_data=(
-f"date:{current_date.isoformat()}"
-),
-)
-)
-builder.adjust(2)
-return builder.as_markup()
-def time_keyboard(booking_date):
-builder = InlineKeyboardBuilder()
-for hour in range(8, 20):
-booking_time = (
-f"{hour:02d}:00"
-)
-if not slot_is_busy(
-booking_date,
-booking_time
-):
-builder.button(
-text=booking_time,
-callback_data=(
-f"time:{booking_time}"
-)
-)
-builder.adjust(3)
-return builder.as_markup()
-def people_keyboard():
-builder = InlineKeyboardBuilder()
-for people in range(1, 11):
-builder.button(
-text=str(people),
-callback_data=(
-f"people:{people}"
-)
-)
-builder.adjust(5)
-return builder.as_markup()
-def admin_keyboard(booking_id):
-return InlineKeyboardMarkup(
-inline_keyboard=[
-[
-InlineKeyboardButton(
-text=" Одобрить",
-callback_data=(
-f"approve:{booking_id}"
-)
-),
-InlineKeyboardButton(
-text=" Отклонить",
-callback_data=(
-f"reject:{booking_id}"
-)
-)
-]
-]
-)
-# =========================================================
-# СОСТОЯНИЯ
-# =========================================================
+async def init_db() -> None:
+await asyncio.to_thread(_init_db_sync)
+async def get_occupied_slots(booking_date: str) -> set:
+return await asyncio.to_thread(_get_occupied_slots_sync, booking_date)
+async def create_booking(**kwargs) -> int | None:
+return await asyncio.to_thread(_create_booking_sync, **kwargs)
+async def get_booking(booking_id: int):
+return await asyncio.to_thread(_get_booking_sync, booking_id)
+async def update_status(booking_id: int, status: str) -> None:
+await asyncio.to_thread(_update_status_sync, booking_id, status)
+async def get_active_bookings() -> list:
+return await asyncio.to_thread(_get_active_bookings_sync)
+# ======================================================================
+# FSM СОСТОЯНИЯ
+# ======================================================================
 class BookingStates(StatesGroup):
-selecting_date = State()
-selecting_time = State()
-selecting_people = State()
+choosing_date = State()
+choosing_time = State()
+choosing_people = State()
 entering_name = State()
 entering_contact = State()
 entering_purpose = State()
-ROUTER = Router()
-# =========================================================
-# MIDDLEWARE: автоматически регистрируем админа
-# по username при любом обращении к боту
-# =========================================================
-class AdminRegistryMiddleware(BaseMiddleware):
-async def __call__(self, handler, event, data):
-user = data.get("event_from_user")
-if user is None:
-user = getattr(event, "from_user", None)
-if user is not None:
-register_admin_if_needed(user)
-return await handler(event, data)
-ROUTER.message.middleware(AdminRegistryMiddleware())
-ROUTER.callback_query.middleware(AdminRegistryMiddleware())
-# =========================================================
-# ФОРМАТ ЗАЯВКИ
-# =========================================================
-def booking_text(booking):
-username = (
-f"@{html.escape(booking['username'])}"
-if booking["username"]
-else "не указан"
+# ======================================================================
+# CALLBACK DATA
+# ======================================================================
+class MenuCB(CallbackData, prefix="menu"):
+action: str # "book" | "cancel"
+class DateCB(CallbackData, prefix="dt"):
+value: str # YYYY-MM-DD
+class TimeCB(CallbackData, prefix="tm"):
+date: str
+slot: str
+class PeopleCB(CallbackData, prefix="ppl"):
+count: int
+class AdminDecisionCB(CallbackData, prefix="adm"):
+action: str # "approve" | "reject"
+booking_id: int
+class DeleteAllCB(CallbackData, prefix="delall"):
+action: str # "confirm" | "cancel"
+# ======================================================================
+# КЛАВИАТУРЫ
+# ======================================================================
+def main_menu_keyboard():
+kb = InlineKeyboardBuilder()
+kb.button(text=" Забронировать аудиторию", callback_data=MenuCB(action="book"))
+kb.button(text=" Отменить", callback_data=MenuCB(action="cancel"))
+kb.adjust(1)
+return kb.as_markup()
+def dates_keyboard():
+kb = InlineKeyboardBuilder()
+start = today_local()
+for i in range(DAYS_AHEAD):
+d = start + timedelta(days=i)
+kb.button(text=format_date_button(d), callback_data=DateCB(value=d.isoformat()))
+kb.button(text=" Отменить", callback_data=MenuCB(action="cancel"))
+kb.adjust(3)
+return kb.as_markup()
+def times_keyboard(booking_date: str, occupied: set):
+kb = InlineKeyboardBuilder()
+for hour in range(OPEN_HOUR, CLOSE_HOUR):
+sid = slot_id(hour)
+if sid in occupied:
+continue
+kb.button(
+text=slot_label(hour),
+callback_data=TimeCB(date=booking_date, slot=sid),
 )
-return (
-"<b> НОВАЯ ЗАЯВКА</b>\n\n"
-f" <b>Дата:</b> "
-f"{html.escape(booking['booking_date'])}\n"
-f" <b>Время:</b> "
-f"{html.escape(booking['booking_time'])}\n"
-f" <b>Людей:</b> "
-f"{booking['people']}\n"
-f" <b>Имя:</b> "
-f"{html.escape(booking['name'])}\n"
-f" <b>Контакт:</b> "
-f"{html.escape(booking['contact'])}\n"
-f" <b>Цель:</b> "
-f"{html.escape(booking['purpose'])}\n"
-f" <b>Telegram:</b> "
-f"{username}"
+kb.adjust(3)
+return kb.as_markup()
+kb.button(text=" Отменить", callback_data=MenuCB(action="cancel"))
+def people_keyboard():
+kb = InlineKeyboardBuilder()
+for n in range(1, MAX_PEOPLE + 1):
+kb.button(text=str(n), callback_data=PeopleCB(count=n))
+kb.button(text=" Отменить", callback_data=MenuCB(action="cancel"))
+kb.adjust(6)
+return kb.as_markup()
+def admin_decision_keyboard(booking_id: int):
+kb = InlineKeyboardBuilder()
+kb.button(
+text=" ПОДТВЕРДИТЬ",
+callback_data=AdminDecisionCB(action="approve", booking_id=booking_id),
 )
-def announcement_text(booking):
-start_hour = int(
-booking["booking_time"][:2]
+kb.button(
+text=" ОТКЛОНИТЬ",
+callback_data=AdminDecisionCB(action="reject", booking_id=booking_id),
 )
-end_hour = start_hour + 1
-start_time = booking["booking_time"]
-end_time = f"{end_hour:02d}:00"
-return (
-" <b>РЕПЕТИЦИЯ СОСТОИТСЯ</b>\n\n"
-f" <b>Дата:</b> "
-f"{html.escape(booking['booking_date'])}\n"
-f" <b>Время:</b> "
-f"{start_time}–{end_time}\n"
-f" <b>Количество:</b> "
-f"{booking['people']} чел.\n"
-f" <b>Цель:</b> "
-f"{html.escape(booking['purpose'])}"
-)
-# =========================================================
-# ПУБЛИКАЦИЯ РЕПЕТИЦИИ
-# =========================================================
-async def publish_rehearsal(
-bot,
-booking
-):
-text = announcement_text(booking)
-# 1) В канал/группу, если он задан.
-if ANNOUNCEMENT_CHAT_ID:
-try:
-await bot.send_message(
-chat_id=ANNOUNCEMENT_CHAT_ID,
-text=text
-)
-logger.info(
-"Репетиция опубликована в канале."
-)
-except Exception:
-logger.exception(
-"Ошибка публикации репетиции в канале."
-)
-# 2) Всем админам лично — готовый текст,
-# который можно переслать/скопировать.
-for admin_id in get_admin_ids():
-try:
-await bot.send_message(
-chat_id=admin_id,
-text=text
-)
-except Exception:
-logger.warning(
-"Не удалось отправить объявление админу %s",
-admin_id
-)
-# =========================================================
-# START
-# =========================================================
-@ROUTER.message(CommandStart())
-async def start(
-message: Message,
-state: FSMContext
-):
-await state.clear()
-await state.set_state(
-BookingStates.selecting_date
-)
+kb.adjust(2)
+return kb.as_markup()
+def delete_confirm_keyboard():
+kb = InlineKeyboardBuilder()
+kb.button(text=" Да, отменить все", callback_data=DeleteAllCB(action="confirm"))
+kb.button(text=" Нет", callback_data=DeleteAllCB(action="cancel"))
+kb.adjust(1)
+return kb.as_markup()
+# ======================================================================
+# РОУТЕР И ХЕНДЛЕРЫ
+# ======================================================================
+router = Router()
+def is_admin(user_id: int) -> bool:
+return user_id == ADMIN_USER_ID
+async def send_main_menu(message: Message) -> None:
 await message.answer(
-" <b>Гаранинцы</b>\n\n"
-" Выберите дату репетиции:",
-reply_markup=date_keyboard()
+" <b>ГАРАНИНЦЫ</b>\n\nДобро пожаловать!\n\nВыберите действие:",
+reply_markup=main_menu_keyboard(),
 )
-# =========================================================
-# BOOK
-# =========================================================
-@ROUTER.message(Command("book"))
-async def book_command(
-message: Message,
-state: FSMContext
-):
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext) -> None:
 await state.clear()
-await state.set_state(
-BookingStates.selecting_date
-)
-await message.answer(
+await send_main_menu(message)
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext) -> None:
+current_state = await state.get_state()
+await state.clear()
+if current_state is None:
+await message.answer("Нечего отменять.")
+else:
+await message.answer(" Бронирование отменено.")
+async def start_booking_flow(bot: Bot, chat_id: int, state: FSMContext) -> None:
+await state.set_state(BookingStates.choosing_date)
+await bot.send_message(
+chat_id,
 " Выберите дату:",
-reply_markup=date_keyboard()
+reply_markup=dates_keyboard(),
 )
-# =========================================================
-# ВЫБОР ДАТЫ
-# =========================================================
-@ROUTER.callback_query(
-F.data.startswith("date:")
+@router.message(Command("book"))
+async def cmd_book(message: Message, state: FSMContext) -> None:
+await state.clear()
+await start_booking_flow(message.bot, message.chat.id, state)
+@router.callback_query(MenuCB.filter(F.action == "book"))
+async def cb_menu_book(call: CallbackQuery, state: FSMContext) -> None:
+await state.clear()
+await call.answer()
+await start_booking_flow(call.bot, call.message.chat.id, state)
+@router.callback_query(MenuCB.filter(F.action == "cancel"))
+async def cb_menu_cancel(call: CallbackQuery, state: FSMContext) -> None:
+await state.clear()
+await call.answer()
+try:
+await call.message.edit_text(" Бронирование отменено.")
+except TelegramBadRequest:
+await call.message.answer(" Бронирование отменено.")
+@router.callback_query(BookingStates.choosing_date, DateCB.filter())
+async def cb_date_chosen(
+call: CallbackQuery, callback_data: DateCB, state: FSMContext
+) -> None:
+await call.answer()
+booking_date = callback_data.value
+occupied = await get_occupied_slots(booking_date)
+free_slots_exist = any(
+slot_id(h) not in occupied for h in range(OPEN_HOUR, CLOSE_HOUR)
 )
-async def select_date(
-callback: CallbackQuery,
-state: FSMContext
-):
-booking_date = callback.data.split(
-":",
-1
-)[1]
-await state.update_data(
-booking_date=booking_date
+await state.update_data(booking_date=booking_date)
+await state.set_state(BookingStates.choosing_time)
+d = parse_iso_date(booking_date)
+header = f" Выберите время на {format_date_human(d)}:"
+if not free_slots_exist:
+header = (
+f"На {format_date_human(d)} свободных часов не осталось.\n"
+"Пожалуйста, выберите другую дату или отмените бронирование."
 )
-await state.set_state(
-BookingStates.selecting_time
+try:
+await call.message.edit_text(header, reply_markup=times_keyboard(booking_date, except TelegramBadRequest:
+await call.message.answer(header, reply_markup=times_keyboard(booking_date, occupied)
+occupi
+@router.callback_query(BookingStates.choosing_time, TimeCB.filter())
+async def cb_time_chosen(
+call: CallbackQuery, callback_data: TimeCB, state: FSMContext
+) -> None:
+booking_date = callback_data.date
+slot = callback_data.slot
+# Повторно проверяем занятость на момент выбора — защита от гонки
+# в интерфейсе (окончательная защита всё равно на уровне БД).
+occupied = await get_occupied_slots(booking_date)
+if slot in occupied:
+await call.answer(" Это время уже занято.", show_alert=True)
+try:
+await call.message.edit_reply_markup(
+reply_markup=times_keyboard(booking_date, occupied)
 )
-await callback.message.edit_text(
-f" <b>{booking_date}</b>\n\n"
-" Выберите свободное время:",
-reply_markup=time_keyboard(
-booking_date
-)
-)
-await callback.answer()
-# =========================================================
-# ВЫБОР ВРЕМЕНИ
-# =========================================================
-@ROUTER.callback_query(
-F.data.startswith("time:")
-)
-async def select_time(
-callback: CallbackQuery,
-state: FSMContext
-):
-data = await state.get_data()
-booking_date = data.get(
-"booking_date"
-)
-if not booking_date:
-await callback.answer(
-"Сначала выберите дату.",
-show_alert=True
-)
+except TelegramBadRequest:
+pass
 return
-booking_time = callback.data.split(
-":",
-1
-)[1]
-if slot_is_busy(
-booking_date,
-booking_time
-):
-await callback.answer(
-"Это время уже занято.",
-show_alert=True
+await call.answer()
+await state.update_data(time_slot=slot)
+await state.set_state(BookingStates.choosing_people)
+try:
+await call.message.edit_text(
+" Сколько людей будет присутствовать?",
+reply_markup=people_keyboard(),
 )
-await callback.message.edit_reply_markup(
-reply_markup=time_keyboard(
-booking_date
+except TelegramBadRequest:
+await call.message.answer(
+" Сколько людей будет присутствовать?",
+reply_markup=people_keyboard(),
 )
-)
+@router.callback_query(BookingStates.choosing_people, PeopleCB.filter())
+async def cb_people_chosen(
+call: CallbackQuery, callback_data: PeopleCB, state: FSMContext
+) -> None:
+await call.answer()
+await state.update_data(people=callback_data.count)
+await state.set_state(BookingStates.entering_name)
+try:
+await call.message.edit_text("Введите ваше имя:")
+except TelegramBadRequest:
+await call.message.answer("Введите ваше имя:")
+@router.message(BookingStates.entering_name, F.text)
+async def process_name(message: Message, state: FSMContext) -> None:
+name = message.text.strip()
+if not name:
+await message.answer("Пожалуйста, введите корректное имя:")
 return
-await state.update_data(
-booking_time=booking_time
-)
-await state.set_state(
-BookingStates.selecting_people
-)
-await callback.message.edit_text(
-f" {booking_date}\n"
-f" {booking_time}\n\n"
-" Сколько будет человек?",
-reply_markup=people_keyboard()
-)
-await callback.answer()
-# =========================================================
-# ЛЮДИ
-# =========================================================
-@ROUTER.callback_query(
-F.data.startswith("people:")
-)
-async def select_people(
-callback: CallbackQuery,
-state: FSMContext
-):
-people = int(
-callback.data.split(
-":",
-1
-)[1]
-)
-await state.update_data(
-people=people
-)
-await state.set_state(
-BookingStates.entering_name
-)
-await callback.message.edit_text(
-" Введите ваше имя:"
-)
-await callback.answer()
-# =========================================================
-# ИМЯ
-# =========================================================
-@ROUTER.message(
-BookingStates.entering_name
-)
-async def enter_name(
-message: Message,
-state: FSMContext
-):
-name = (
-).strip()
-message.text or ""
-if len(name) < 2:
-await message.answer(
-"Введите имя."
-)
+await state.update_data(name=name)
+await state.set_state(BookingStates.entering_contact)
+await message.answer("Введите номер телефона или другой контакт:")
+@router.message(BookingStates.entering_contact, F.text)
+async def process_contact(message: Message, state: FSMContext) -> None:
+contact = message.text.strip()
+if not contact:
+await message.answer("Пожалуйста, введите корректный контакт:")
 return
-await state.update_data(
-name=name
-)
-await state.set_state(
-BookingStates.entering_contact
-)
-await message.answer(
-" Введите номер телефона "
-"или другой контакт:"
-)
-# =========================================================
-# КОНТАКТ
-# =========================================================
-@ROUTER.message(
-BookingStates.entering_contact
-)
-async def enter_contact(
-message: Message,
-state: FSMContext
-):
-contact = (
-).strip()
-message.text or ""
-if len(contact) < 3:
-await message.answer(
-"Введите корректный контакт."
-)
-return
-await state.update_data(
-contact=contact
-)
-await state.set_state(
-BookingStates.entering_purpose
-)
-await message.answer(
-" Для чего бронируете аудиторию?"
-)
-# =========================================================
-# СОЗДАНИЕ ЗАЯВКИ
-# =========================================================
-@ROUTER.message(
-BookingStates.entering_purpose
-)
-async def enter_purpose(
-message: Message,
-state: FSMContext,
-bot: Bot
-):
-purpose = (
-message.text or ""
-).strip()
-if len(purpose) < 2:
-await message.answer(
-"Напишите цель бронирования."
-)
+await state.update_data(contact=contact)
+await state.set_state(BookingStates.entering_purpose)
+await message.answer("Для чего бронируете аудиторию?")
+@router.message(BookingStates.entering_purpose, F.text)
+async def process_purpose(message: Message, state: FSMContext) -> None:
+purpose = message.text.strip()
+if not purpose:
+await message.answer("Пожалуйста, укажите цель бронирования:")
 return
 data = await state.get_data()
-booking_id = create_booking(
-user_id=message.from_user.id,
-username=message.from_user.username,
-name=data["name"],
-booking_date=data["booking_date"],
-booking_time=data["booking_time"],
-people=data["people"],
-contact=data["contact"],
-purpose=purpose
+booking_date = data["booking_date"]
+time_slot = data["time_slot"]
+people = data["people"]
+name = data["name"]
+contact = data["contact"]
+user = message.from_user
+booking_id = await create_booking(
+user_id=user.id,
+username=user.username,
+name=name,
+booking_date=booking_date,
+time_slot=time_slot,
+people=people,
+contact=contact,
+purpose=purpose,
 )
-if not booking_id:
+if booking_id is None:
+await state.set_state(BookingStates.choosing_time)
+occupied = await get_occupied_slots(booking_date)
 await message.answer(
-" Это время уже заняли.\n\n"
-"Используйте /book "
-"и выберите другое время."
+" К сожалению, это время уже заняли.\n\n"
+"Пожалуйста, выберите другое время:",
+reply_markup=times_keyboard(booking_date, occupied),
 )
+return
 await state.clear()
-return
-booking = get_booking(
-booking_id
-)
-await state.clear()
+d = parse_iso_date(booking_date)
+hour = slot_hour(time_slot)
+time_range = slot_label(hour)
 await message.answer(
-" <b>Заявка отправлена!</b>\n\n"
-f" {booking['booking_date']}\n"
-f" {booking['booking_time']}\n"
-f" {booking['people']} человек\n\n"
-"Ожидайте подтверждения."
+" Заявка отправлена и ожидает подтверждения администратора.\n\n"
+f" Дата: {format_date_human(d)}\n"
+f" Время: {time_range}\n"
+f" Людей: {people}"
 )
-# =====================================================
-# ОТПРАВЛЯЕМ ЗАЯВКУ ВСЕМ АДМИНАМ
-# =====================================================
-for admin_id in get_admin_ids():
-try:
-await bot.send_message(
-chat_id=admin_id,
-text=booking_text(
-booking
-),
-reply_markup=admin_keyboard(
-booking_id
-)
-)
-except Exception:
-logger.exception(
-"НЕ УДАЛОСЬ отправить заявку админу %s",
-admin_id
-)
-# =========================================================
-# ОДОБРИТЬ
-# =========================================================
-@ROUTER.callback_query(
-F.data.startswith("approve:")
-)
-async def approve_booking(
-callback: CallbackQuery,
-bot: Bot
-):
-if not is_admin(callback.from_user.id):
-await callback.answer(
-"У вас нет прав администратора.",
-show_alert=True
-)
-return
-booking_id = callback.data.split(
-":",
-1
-)[1]
-booking = get_booking(
-booking_id
-)
-if not booking:
-await callback.answer(
-"Заявка не найдена.",
-show_alert=True
-)
-return
-if booking["status"] != "pending":
-await callback.answer(
-"Заявка уже обработана.",
-show_alert=True
-)
-return
-update_booking_status(
-booking_id,
-"approved"
-)
-booking = get_booking(
-booking_id
-)
-start_hour = int(
-booking["booking_time"][:2]
-)
-end_time = (
-f"{start_hour + 1:02d}:00"
-)
-# Сообщение пользователю
-try:
-await bot.send_message(
-chat_id=booking["user_id"],
-text=(
-" <b>РЕПЕТИЦИЯ ПОДТВЕРЖДЕНА!</b>\n\n"
-f" <b>Дата:</b> "
-f"{booking['booking_date']}\n"
-f" <b>Время:</b> "
-f"{booking['booking_time']}–"
-f"{end_time}\n"
-f" <b>Людей:</b> "
-f"{booking['people']}"
-)
-)
-except Exception:
-logger.exception(
-"Не удалось уведомить пользователя."
-)
-# Автоматическое объявление о времени репетиции
-# (в канал, если задан, и лично всем админам)
-await publish_rehearsal(
-bot,
-booking
-)
-await callback.message.edit_text(
-booking_text(
-booking
-)
-+
-"\n\n"
-" <b>ОДОБРЕНО</b>"
-)
-await callback.answer(
-"Репетиция подтверждена."
-)
-# =========================================================
-# ОТКЛОНИТЬ
-# =========================================================
-@ROUTER.callback_query(
-F.data.startswith("reject:")
-)
-async def reject_booking(
-callback: CallbackQuery,
-bot: Bot
-):
-if not is_admin(callback.from_user.id):
-await callback.answer(
-"У вас нет прав администратора.",
-show_alert=True
-)
-return
-booking_id = callback.data.split(
-":",
-1
-)[1]
-booking = get_booking(
-booking_id
-)
-if not booking:
-await callback.answer(
-"Заявка не найдена.",
-show_alert=True
-)
-return
-if booking["status"] != "pending":
-await callback.answer(
-"Заявка уже обработана.",
-show_alert=True
-)
-return
-update_booking_status(
-booking_id,
-"rejected"
+username_display = f"@{user.username}" if user.username else "(нет username)"
+admin_text = (
+" НОВАЯ ЗАЯВКА\n\n"
+f" Дата: {booking_date}\n"
+f" Время: {time_range}\n"
+f" Людей: {people}\n\n"
+f" Имя: {name}\n"
+f" Контакт: {contact}\n"
+f" Цель: {purpose}\n\n"
+f" Telegram: {username_display}"
 )
 try:
-await bot.send_message(
-chat_id=booking["user_id"],
-text=(
-" <b>Репетиция отклонена.</b>\n\n"
-f" {booking['booking_date']}\n"
-f" {booking['booking_time']}"
+await message.bot.send_message(
+ADMIN_USER_ID,
+admin_text,
+reply_markup=admin_decision_keyboard(booking_id),
 )
-)
-except Exception:
-logger.exception(
-"Не удалось уведомить пользователя."
-)
-await callback.message.edit_text(
-booking_text(
-get_booking(booking_id)
-)
-+
-"\n\n"
-" <b>ОТКЛОНЕНО</b>"
-)
-await callback.answer(
-"Заявка отклонена."
-)
-# =========================================================
-# /RV
-# =========================================================
-@ROUTER.message(Command("rv"))
-async def rv_command(
-message: Message
-):
-if not is_admin(message.from_user.id):
-await message.answer(
-" У вас нет прав."
-)
-return
-bookings = get_all_active_bookings()
-if not bookings:
-await message.answer(
-" Активных бронирований нет."
-)
-return
-lines = [
-" <b>ТЕКУЩИЕ РЕПЕТИЦИИ</b>\n"
-]
-for booking in bookings:
-hour = int(
-booking["booking_time"][:2]
-)
-end_time = (
-f"{hour + 1:02d}:00"
-)
-lines.append(
-f" {booking['booking_date']} "
-f" {booking['booking_time']}–{end_time} "
-f"— {html.escape(booking['name'])} "
-f"— {booking['people']} чел."
-)
-await message.answer(
-"\n".join(lines)
-)
-# =========================================================
-# /DELETE
-# =========================================================
-@ROUTER.message(Command("delete"))
-async def delete_command(
-message: Message,
-bot: Bot
-):
-if not is_admin(message.from_user.id):
-await message.answer(
-" У вас нет прав."
-)
-return
-bookings = delete_all_active_bookings()
-if not bookings:
-await message.answer(
-" Активных бронирований нет."
-)
-return
-user_ids = set(
-booking["user_id"]
-for booking in bookings
-)
-for user_id in user_ids:
-try:
-await bot.send_message(
-chat_id=user_id,
-text=(
-" <b>Внимание</b>\n\n"
-"Все активные бронирования "
-"были отменены администратором."
-)
-)
-except Exception:
+except (TelegramForbiddenError, TelegramBadRequest) as exc:
 logger.warning(
-"Не удалось уведомить %s",
-user_id
+"Не удалось отправить заявку администратору (id=%s): %s",
+booking_id,
+exc,
 )
+@router.callback_query(AdminDecisionCB.filter())
+async def cb_admin_decision(
+call: CallbackQuery, callback_data: AdminDecisionCB
+) -> None:
+if not is_admin(call.from_user.id):
+await call.answer(" У вас нет прав администратора.", show_alert=True)
+return
+booking = await get_booking(callback_data.booking_id)
+if booking is None:
+await call.answer("Заявка не найдена.", show_alert=True)
+return
+if booking["status"] != "pending":
+await call.answer("Эта заявка уже обработана.", show_alert=True)
+return
+d = parse_iso_date(booking["booking_date"])
+hour = slot_hour(booking["time_slot"])
+time_range = slot_label(hour)
+date_human = format_date_human(d)
+if callback_data.action == "approve":
+await update_status(booking["id"], "approved")
+await call.answer("Заявка подтверждена.")
+try:
+await call.bot.send_message(
+booking["user_id"],
+" РЕПЕТИЦИЯ ПОДТВЕРЖДЕНА!\n\n"
+f" Дата: {date_human}\n"
+f" Время: {time_range}\n"
+f" Людей: {booking['people']}",
+)
+except (TelegramForbiddenError, TelegramBadRequest) as exc:
+logger.warning("Не удалось уведомить пользователя об одобрении: %s", exc)
+if ANNOUNCEMENT_CHAT_ID is not None:
+try:
+await call.bot.send_message(
+ANNOUNCEMENT_CHAT_ID,
+" РЕПЕТИЦИЯ СОСТОИТСЯ\n\n"
+f" Дата: {date_human}\n"
+f" Время: {time_range}\n"
+f" Количество: {booking['people']} человек\n"
+f" Цель: {booking['purpose']}",
+)
+except (TelegramForbiddenError, TelegramBadRequest) as exc:
+logger.warning(
+"Не удалось опубликовать анонс в ANNOUNCEMENT_CHAT_ID: %s", exc
+)
+try:
+await call.message.edit_text(
+call.message.text + "\n\n ПОДТВЕРЖДЕНО"
+)
+except TelegramBadRequest:
+pass
+else: # reject
+await update_status(booking["id"], "rejected")
+await call.answer("Заявка отклонена.")
+try:
+await call.bot.send_message(
+booking["user_id"],
+" Бронирование отклонено.\n\n"
+f" Дата: {date_human}\n"
+f" Время: {time_range}",
+)
+except (TelegramForbiddenError, TelegramBadRequest) as exc:
+logger.warning("Не удалось уведомить пользователя об отклонении: %s", exc)
+try:
+await call.message.edit_text(
+call.message.text + "\n\n ОТКЛОНЕНО"
+)
+except TelegramBadRequest:
+pass
+@router.message(Command("rv"))
+async def cmd_rv(message: Message) -> None:
+if not is_admin(message.from_user.id):
+await message.answer(" return
+У вас нет прав администратора.")
+bookings = await get_active_bookings()
+if not bookings:
+await message.answer(" Активных бронирований нет.")
+return
+blocks = []
+for b in bookings:
+d = parse_iso_date(b["booking_date"])
+hour = slot_hour(b["time_slot"])
+status_label = "ожидает" if b["status"] == "pending" else "подтверждено"
+blocks.append(
+f" {format_date_human(d)}\n"
+f" {slot_label(hour)}\n"
+f" {b['name']}\n"
+f" {b['people']} человек\n"
+f" {b['purpose']}\n"
+f"Статус: {status_label}"
+)
+text = " ТЕКУЩИЕ РЕПЕТИЦИИ\n\n" + "\n\n".join(blocks)
+# Telegram ограничивает длину сообщения — разбиваем при необходимости.
+for chunk_start in range(0, len(text), 4000):
+await message.answer(text[chunk_start:chunk_start + 4000])
+@router.message(Command("delete"))
+async def cmd_delete(message: Message) -> None:
+if not is_admin(message.from_user.id):
+await message.answer(" У вас нет прав администратора.")
+return
+bookings = await get_active_bookings()
+if not bookings:
+await message.answer(" Активных бронирований нет.")
+return
 await message.answer(
-f" Удалено бронирований: "
-f"<b>{len(bookings)}</b>"
+f" Вы собираетесь отменить все активные бронирования ({len(bookings)} шт.).\n"
+"Подтвердите действие:",
+reply_markup=delete_confirm_keyboard(),
 )
-# =========================================================
-# /CANCEL
-# =========================================================
-@ROUTER.message(Command("cancel"))
-async def cancel_command(
-message: Message,
-state: FSMContext
-):
-await state.clear()
+@router.callback_query(DeleteAllCB.filter())
+async def cb_delete_all(call: CallbackQuery, callback_data: DeleteAllCB) -> None:
+if not is_admin(call.from_user.id):
+await call.answer(" У вас нет прав администратора.", show_alert=True)
+return
+if callback_data.action == "cancel":
+await call.answer("Отменено.")
+try:
+await call.message.edit_text("Действие отменено.")
+except TelegramBadRequest:
+pass
+return
+await call.answer()
+bookings = await get_active_bookings()
+for b in bookings:
+await update_status(b["id"], "rejected")
+try:
+await call.bot.send_message(
+b["user_id"],
+" Внимание!\n\nВаше бронирование было отменено администратором.",
+)
+except (TelegramForbiddenError, TelegramBadRequest) as exc:
+logger.warning(
+"Не удалось уведомить пользователя %s об отмене: %s", b["user_id"], exc
+)
+try:
+await call.message.edit_text(f" Отменено бронирований: {len(bookings)}.")
+except TelegramBadRequest:
+await call.message.answer(f" Отменено бронирований: {len(bookings)}.")
+# Фолбэк на случай, если пользователь пишет текст вне ожидаемого состояния.
+@router.message()
+async def fallback_handler(message: Message, state: FSMContext) -> None:
+current_state = await state.get_state()
+if current_state is not None:
 await message.answer(
-" Бронирование отменено."
+"Пожалуйста, воспользуйтесь кнопками выше, либо отправьте /cancel, "
+"чтобы прервать текущее бронирование."
 )
-# =========================================================
-# /WHOAMI (проверить, определился ли админ)
-# =========================================================
-@ROUTER.message(Command("whoami"))
-async def whoami_command(
-message: Message
-):
-status = (
-" Вы админ."
-if is_admin(message.from_user.id)
-else "Вы обычный пользователь."
-)
-await message.answer(
-f"ID: <code>{message.from_user.id}</code>\n"
-f"Username: @{message.from_user.username or '—'}\n\n"
-f"{status}"
-)
-# =========================================================
-# ЗАПУСК БОТА
-# =========================================================
-async def main():
-init_db()
+return
+await send_main_menu(message)
+# ======================================================================
+# ТОЧКА ВХОДА
+# ======================================================================
+async def main() -> None:
+await init_db()
 bot = Bot(
 token=BOT_TOKEN,
-default=DefaultBotProperties(
-parse_mode=ParseMode.HTML
+default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
-)
-dp = Dispatcher()
-dp.include_router(
-ROUTER
-)
-logger.info(
-"================================"
-)
-logger.info(
-"Бот запущен."
-)
-logger.info(
-"Главный администратор: %s",
-ADMIN_USER_ID
-)
-logger.info(
-"Доп. администратор (username): @%s",
-ADMIN_USERNAME
-)
-logger.info(
-"================================"
-)
-try:
-await dp.start_polling(
-bot
-)
-finally:
-await bot.session.close()
+dp = Dispatcher(storage=MemoryStorage())
+dp.include_router(router)
+logger.info("Бот «Гаранинцы» запускается...")
+await bot.delete_webhook(drop_pending_updates=True)
+await dp.start_polling(bot)
 if __name__ == "__main__":
 asyncio.run(main() )
