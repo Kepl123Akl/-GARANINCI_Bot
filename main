@@ -102,7 +102,6 @@ def init_db():
             ON bookings(date, time_start)
             WHERE status IN ('pending', 'approved');
 
-
             CREATE TABLE IF NOT EXISTS announcement_chats (
                 chat_id INTEGER PRIMARY KEY,
                 chat_type TEXT NOT NULL,
@@ -119,7 +118,7 @@ def init_db():
 
 
 # ============================================================
-# ГРУППЫ ДЛЯ АВТОМАТИЧЕСКОЙ ПУБЛИКАЦИИ
+# ГРУППЫ И КАНАЛЫ
 # ============================================================
 
 def save_announcement_chat(
@@ -145,9 +144,7 @@ def save_announcement_chat(
                 chat_id,
                 chat_type,
                 title or "",
-                datetime.now(
-                    TIMEZONE
-                ).isoformat(
+                datetime.now(TIMEZONE).isoformat(
                     timespec="seconds"
                 ),
             ),
@@ -159,16 +156,14 @@ def save_announcement_chat(
         conn.close()
 
     logger.info(
-        "Группа сохранена: %s | %s | %s",
+        "Чат зарегистрирован: id=%s type=%s title=%s",
         chat_id,
         chat_type,
         title,
     )
 
 
-def remove_announcement_chat(
-    chat_id: int,
-):
+def remove_announcement_chat(chat_id: int):
     conn = get_connection()
 
     try:
@@ -186,7 +181,7 @@ def remove_announcement_chat(
         conn.close()
 
     logger.info(
-        "Группа удалена: %s",
+        "Чат удалён из списка: %s",
         chat_id,
     )
 
@@ -208,7 +203,7 @@ def get_announcement_chats():
 
 
 # ============================================================
-# АВТОМАТИЧЕСКОЕ ОТСЛЕЖИВАНИЕ ГРУПП
+# АВТОМАТИЧЕСКАЯ РЕГИСТРАЦИЯ ГРУПП И КАНАЛОВ
 # ============================================================
 
 router = Router()
@@ -219,17 +214,16 @@ async def bot_chat_member_update(
     event: ChatMemberUpdated,
 ):
     chat = event.chat
-
     new_status = event.new_chat_member.status
 
     logger.info(
-        "Изменение статуса бота: chat=%s type=%s status=%s",
+        "Изменение статуса бота: chat_id=%s type=%s title=%s status=%s",
         chat.id,
         chat.type,
+        chat.title,
         new_status,
     )
 
-    # Бот добавлен / имеет права
     if new_status in (
         "member",
         "administrator",
@@ -245,18 +239,15 @@ async def bot_chat_member_update(
                 title=chat.title or "",
             )
 
-    # Бот удалён
     elif new_status in (
         "left",
         "kicked",
     ):
-        remove_announcement_chat(
-            chat.id
-        )
+        remove_announcement_chat(chat.id)
 
 
 # ============================================================
-# ОТПРАВКА ВО ВСЕ ГРУППЫ
+# ОТПРАВКА ОБЪЯВЛЕНИЯ ВО ВСЕ ГРУППЫ И КАНАЛЫ
 # ============================================================
 
 async def send_announcement_to_all_chats(
@@ -267,60 +258,69 @@ async def send_announcement_to_all_chats(
 
     if not chats:
         logger.warning(
-            "Нет зарегистрированных групп для публикации."
+            "НЕТ ЗАРЕГИСТРИРОВАННЫХ ГРУПП И КАНАЛОВ."
         )
-        return
+        return 0
+
+    success_count = 0
 
     logger.info(
-        "Начинаем рассылку в %s чатов.",
+        "Начинаем публикацию в %s чатов.",
         len(chats),
     )
 
     for chat in chats:
-
         chat_id = chat["chat_id"]
+        chat_title = chat["title"] or str(chat_id)
 
         try:
-
             await bot.send_message(
                 chat_id=chat_id,
                 text=text,
             )
 
+            success_count += 1
+
             logger.info(
-                "Анонс успешно отправлен в %s",
+                "Сообщение успешно отправлено: %s (%s)",
+                chat_title,
                 chat_id,
             )
 
         except TelegramForbiddenError:
-
             logger.warning(
-                "Нет прав на отправку в %s. Удаляем чат.",
+                "Нет прав для отправки в %s (%s). Чат удалён из списка.",
+                chat_title,
                 chat_id,
             )
 
-            remove_announcement_chat(
-                chat_id
-            )
+            remove_announcement_chat(chat_id)
 
         except TelegramBadRequest as exc:
-
             logger.error(
-                "Telegram ошибка в чате %s: %s",
+                "Telegram BadRequest в %s (%s): %s",
+                chat_title,
                 chat_id,
                 exc,
             )
 
         except Exception as exc:
-
             logger.exception(
-                "Ошибка отправки в %s: %s",
+                "Ошибка отправки в %s (%s): %s",
+                chat_title,
                 chat_id,
                 exc,
             )
 
-        # Небольшая пауза между чатами
         await asyncio.sleep(0.3)
+
+    logger.info(
+        "Публикация завершена. Успешно: %s из %s.",
+        success_count,
+        len(chats),
+    )
+
+    return success_count
 
 
 # ============================================================
@@ -344,27 +344,20 @@ class DeleteStates(StatesGroup):
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ============================================================
 
-def is_admin(user_id: int) -> bool:
+def is_admin(user_id: Optional[int]) -> bool:
     return user_id == ADMIN_USER_ID
 
 
-def format_date_ru(
-    date_str: str,
-) -> str:
-
+def format_date_ru(date_str: str) -> str:
     date = datetime.strptime(
         date_str,
         "%Y-%m-%d",
     ).date()
 
-    return date.strftime(
-        "%d.%m.%Y"
-    )
+    return date.strftime("%d.%m.%Y")
 
 
-def slot_bounds(
-    hour: int,
-):
+def slot_bounds(hour: int):
     return (
         f"{hour:02d}:00",
         f"{hour + 1:02d}:00",
@@ -376,7 +369,6 @@ def slot_bounds(
 # ============================================================
 
 def main_menu_keyboard():
-
     builder = InlineKeyboardBuilder()
 
     builder.button(
@@ -390,20 +382,12 @@ def main_menu_keyboard():
 
 
 def date_keyboard():
-
     builder = InlineKeyboardBuilder()
 
-    today = datetime.now(
-        TIMEZONE
-    ).date()
+    today = datetime.now(TIMEZONE).date()
 
-    for i in range(
-        DAYS_AHEAD
-    ):
-
-        date = today + timedelta(
-            days=i
-        )
+    for i in range(DAYS_AHEAD):
+        date = today + timedelta(days=i)
 
         weekday = WEEKDAYS_RU[
             date.weekday()
@@ -424,14 +408,10 @@ def date_keyboard():
     return builder.as_markup()
 
 
-def get_busy_hours(
-    date_str: str,
-):
-
+def get_busy_hours(date_str: str):
     conn = get_connection()
 
     try:
-
         rows = conn.execute(
             """
             SELECT time_start
@@ -444,8 +424,7 @@ def get_busy_hours(
 
         return {
             int(
-                row["time_start"]
-                .split(":")[0]
+                row["time_start"].split(":")[0]
             )
             for row in rows
         }
@@ -454,13 +433,8 @@ def get_busy_hours(
         conn.close()
 
 
-def time_keyboard(
-    date_str: str,
-):
-
-    busy = get_busy_hours(
-        date_str
-    )
+def time_keyboard(date_str: str):
+    busy = get_busy_hours(date_str)
 
     builder = InlineKeyboardBuilder()
 
@@ -470,19 +444,14 @@ def time_keyboard(
         WORK_START_HOUR,
         WORK_END_HOUR,
     ):
-
         if hour in busy:
             continue
 
-        start, end = slot_bounds(
-            hour
-        )
+        start, end = slot_bounds(hour)
 
         builder.button(
             text=f"{start}–{end}",
-            callback_data=(
-                f"time:{hour}"
-            ),
+            callback_data=f"time:{hour}",
         )
 
         free_count += 1
@@ -496,19 +465,15 @@ def time_keyboard(
 
 
 def people_keyboard():
-
     builder = InlineKeyboardBuilder()
 
     for people in range(
         1,
         MAX_PEOPLE + 1,
     ):
-
         builder.button(
             text=str(people),
-            callback_data=(
-                f"people:{people}"
-            ),
+            callback_data=f"people:{people}",
         )
 
     builder.adjust(6)
@@ -519,21 +484,16 @@ def people_keyboard():
 def admin_decision_keyboard(
     booking_id: int,
 ):
-
     builder = InlineKeyboardBuilder()
 
     builder.button(
         text="ПОДТВЕРДИТЬ",
-        callback_data=(
-            f"approve:{booking_id}"
-        ),
+        callback_data=f"approve:{booking_id}",
     )
 
     builder.button(
         text="ОТКЛОНИТЬ",
-        callback_data=(
-            f"reject:{booking_id}"
-        ),
+        callback_data=f"reject:{booking_id}",
     )
 
     builder.adjust(2)
@@ -542,7 +502,6 @@ def admin_decision_keyboard(
 
 
 def delete_confirm_keyboard():
-
     builder = InlineKeyboardBuilder()
 
     builder.button(
@@ -575,11 +534,9 @@ def create_booking(
     contact: str,
     purpose: str,
 ):
-
     conn = get_connection()
 
     try:
-
         cursor = conn.execute(
             """
             INSERT INTO bookings
@@ -612,9 +569,7 @@ def create_booking(
                 people_count,
                 contact,
                 purpose,
-                datetime.now(
-                    TIMEZONE
-                ).isoformat(
+                datetime.now(TIMEZONE).isoformat(
                     timespec="seconds"
                 ),
             ),
@@ -628,14 +583,10 @@ def create_booking(
         conn.close()
 
 
-def get_booking(
-    booking_id: int,
-):
-
+def get_booking(booking_id: int):
     conn = get_connection()
 
     try:
-
         return conn.execute(
             """
             SELECT *
@@ -653,11 +604,9 @@ def set_booking_status(
     booking_id: int,
     status: str,
 ):
-
     conn = get_connection()
 
     try:
-
         conn.execute(
             """
             UPDATE bookings
@@ -677,11 +626,9 @@ def set_booking_status(
 
 
 def get_active_bookings():
-
     conn = get_connection()
 
     try:
-
         return conn.execute(
             """
             SELECT *
@@ -696,11 +643,9 @@ def get_active_bookings():
 
 
 def clear_all_active_bookings():
-
     conn = get_connection()
 
     try:
-
         rows = conn.execute(
             """
             SELECT *
@@ -726,27 +671,21 @@ def clear_all_active_bookings():
 
 
 # ============================================================
-# START
+# /START
 # ============================================================
 
-@router.message(
-    CommandStart()
-)
+@router.message(CommandStart())
 async def start_command(
     message: Message,
     state: FSMContext,
 ):
-
     await state.clear()
 
-    # Если бот находится в группе,
-    # автоматически регистрируем её.
     if message.chat.type in (
         "group",
         "supergroup",
         "channel",
     ):
-
         save_announcement_chat(
             chat_id=message.chat.id,
             chat_type=message.chat.type,
@@ -757,116 +696,19 @@ async def start_command(
         "ГАРАНИНЦЫ\n\n"
         "Добро пожаловать!\n\n"
         "Выберите действие:",
-        reply_markup=(
-            main_menu_keyboard()
-        ),
+        reply_markup=main_menu_keyboard(),
     )
-
-
-# ============================================================
-# /REZA
-# ============================================================
-
-@router.message(
-    Command("reza")
-)
-async def reza_command(
-    message: Message,
-):
-
-    if not is_admin(
-        message.from_user.id
-    ):
-
-        await message.answer(
-            "У вас нет прав администратора."
-        )
-
-        return
-
-    # Если /reza используется в группе,
-    # гарантированно сохраняем эту группу.
-    if message.chat.type in (
-        "group",
-        "supergroup",
-        "channel",
-    ):
-
-        save_announcement_chat(
-            chat_id=message.chat.id,
-            chat_type=message.chat.type,
-            title=message.chat.title or "",
-        )
-
-    text = message.text or ""
-
-    parts = text.split(
-        maxsplit=1
-    )
-
-    if len(parts) < 2:
-
-        await message.answer(
-            "Использование:\n\n"
-            "/reza Текст сообщения"
-        )
-
-        return
-
-    reza_text = parts[1].strip()
-
-    if not reza_text:
-
-        await message.answer(
-            "После /reza нужно написать текст."
-        )
-
-        return
-
-    try:
-
-        await message.bot.send_message(
-            chat_id=message.chat.id,
-            text=reza_text,
-        )
-
-        # Удаляем команду
-        try:
-            await message.delete()
-        except Exception:
-            pass
-
-    except TelegramForbiddenError:
-
-        await message.answer(
-            "Бот не имеет права отправлять "
-            "сообщения в этот чат."
-        )
-
-    except TelegramBadRequest as exc:
-
-        logger.error(
-            "/reza error: %s",
-            exc,
-        )
-
-        await message.answer(
-            "Не удалось отправить сообщение."
-        )
 
 
 # ============================================================
 # /BOOK
 # ============================================================
 
-@router.message(
-    Command("book")
-)
+@router.message(Command("book"))
 async def book_command(
     message: Message,
     state: FSMContext,
 ):
-
     await state.clear()
 
     await state.set_state(
@@ -875,14 +717,12 @@ async def book_command(
 
     await message.answer(
         "Выберите дату:",
-        reply_markup=(
-            date_keyboard()
-        ),
+        reply_markup=date_keyboard(),
     )
 
 
 # ============================================================
-# НАЖАТИЕ "ЗАБРОНИРОВАТЬ"
+# КНОПКА ЗАБРОНИРОВАТЬ
 # ============================================================
 
 @router.callback_query(
@@ -892,7 +732,6 @@ async def book_start_callback(
     callback: CallbackQuery,
     state: FSMContext,
 ):
-
     await callback.answer()
 
     await state.clear()
@@ -903,9 +742,7 @@ async def book_start_callback(
 
     await callback.message.answer(
         "Выберите дату:",
-        reply_markup=(
-            date_keyboard()
-        ),
+        reply_markup=date_keyboard(),
     )
 
 
@@ -921,29 +758,25 @@ async def choose_date(
     callback: CallbackQuery,
     state: FSMContext,
 ):
-
-    await callback.answer()
-
     date_str = callback.data.split(
         ":",
         1,
     )[1]
 
-    keyboard = time_keyboard(
-        date_str
-    )
+    keyboard = time_keyboard(date_str)
 
     if keyboard is None:
+        await callback.answer()
 
         await callback.message.answer(
             "На эту дату всё занято.\n\n"
             "Выберите другую дату:",
-            reply_markup=(
-                date_keyboard()
-            ),
+            reply_markup=date_keyboard(),
         )
 
         return
+
+    await callback.answer()
 
     await state.update_data(
         date=date_str
@@ -972,15 +805,11 @@ async def choose_time(
     callback: CallbackQuery,
     state: FSMContext,
 ):
-
     data = await state.get_data()
 
-    date_str = data.get(
-        "date"
-    )
+    date_str = data.get("date")
 
     if not date_str:
-
         await callback.answer(
             "Сессия устарела.",
             show_alert=True,
@@ -997,12 +826,9 @@ async def choose_time(
         )[1]
     )
 
-    busy = get_busy_hours(
-        date_str
-    )
+    busy = get_busy_hours(date_str)
 
     if hour in busy:
-
         await callback.answer(
             "Это время уже занято.",
             show_alert=True,
@@ -1012,9 +838,7 @@ async def choose_time(
 
     await callback.answer()
 
-    start, end = slot_bounds(
-        hour
-    )
+    start, end = slot_bounds(hour)
 
     await state.update_data(
         time_start=start,
@@ -1028,14 +852,12 @@ async def choose_time(
     await callback.message.answer(
         f"Время: {start}–{end}\n\n"
         "Сколько будет человек?",
-        reply_markup=(
-            people_keyboard()
-        ),
+        reply_markup=people_keyboard(),
     )
 
 
 # ============================================================
-# ЛЮДИ
+# КОЛИЧЕСТВО ЛЮДЕЙ
 # ============================================================
 
 @router.callback_query(
@@ -1046,9 +868,6 @@ async def choose_people(
     callback: CallbackQuery,
     state: FSMContext,
 ):
-
-    await callback.answer()
-
     people = int(
         callback.data.split(
             ":",
@@ -1057,13 +876,14 @@ async def choose_people(
     )
 
     if people < 1 or people > MAX_PEOPLE:
-
         await callback.answer(
             "Недопустимое количество.",
             show_alert=True,
         )
 
         return
+
+    await callback.answer()
 
     await state.update_data(
         people_count=people
@@ -1090,11 +910,9 @@ async def enter_name(
     message: Message,
     state: FSMContext,
 ):
-
     name = message.text.strip()
 
     if not name:
-
         await message.answer(
             "Введите имя."
         )
@@ -1127,11 +945,9 @@ async def enter_contact(
     message: Message,
     state: FSMContext,
 ):
-
     contact = message.text.strip()
 
     if not contact:
-
         await message.answer(
             "Введите контакт."
         )
@@ -1152,7 +968,7 @@ async def enter_contact(
 
 
 # ============================================================
-# ЦЕЛЬ + СОЗДАНИЕ ЗАЯВКИ
+# ЦЕЛЬ И СОЗДАНИЕ ЗАЯВКИ
 # ============================================================
 
 @router.message(
@@ -1163,11 +979,9 @@ async def enter_purpose(
     message: Message,
     state: FSMContext,
 ):
-
     purpose = message.text.strip()
 
     if not purpose:
-
         await message.answer(
             "Введите цель бронирования."
         )
@@ -1177,47 +991,32 @@ async def enter_purpose(
     data = await state.get_data()
 
     date_str = data["date"]
-
     time_start = data["time_start"]
-
     time_end = data["time_end"]
-
     people_count = data["people_count"]
-
     name = data["name"]
-
     contact = data["contact"]
 
-    # Проверяем ещё раз,
-    # не заняли ли время.
-    busy = get_busy_hours(
-        date_str
-    )
+    busy = get_busy_hours(date_str)
 
     hour = int(
         time_start.split(":")[0]
     )
 
     if hour in busy:
-
         await state.set_state(
             BookingStates.choosing_time
         )
 
-        keyboard = time_keyboard(
-            date_str
-        )
+        keyboard = time_keyboard(date_str)
 
         if keyboard:
-
             await message.answer(
                 "Это время уже заняли.\n\n"
                 "Выберите другое:",
                 reply_markup=keyboard,
             )
-
         else:
-
             await state.set_state(
                 BookingStates.choosing_date
             )
@@ -1225,15 +1024,12 @@ async def enter_purpose(
             await message.answer(
                 "На эту дату больше "
                 "нет свободного времени.",
-                reply_markup=(
-                    date_keyboard()
-                ),
+                reply_markup=date_keyboard(),
             )
 
         return
 
     try:
-
         booking_id = create_booking(
             user_id=message.from_user.id,
             username=message.from_user.username,
@@ -1247,7 +1043,6 @@ async def enter_purpose(
         )
 
     except sqlite3.IntegrityError:
-
         await message.answer(
             "Это время только что заняли. "
             "Попробуйте выбрать другое."
@@ -1257,12 +1052,9 @@ async def enter_purpose(
             BookingStates.choosing_time
         )
 
-        keyboard = time_keyboard(
-            date_str
-        )
+        keyboard = time_keyboard(date_str)
 
         if keyboard:
-
             await message.answer(
                 "Свободное время:",
                 reply_markup=keyboard,
@@ -1300,19 +1092,15 @@ async def enter_purpose(
     )
 
     try:
-
         await message.bot.send_message(
             chat_id=ADMIN_USER_ID,
             text=admin_text,
-            reply_markup=(
-                admin_decision_keyboard(
-                    booking_id
-                )
+            reply_markup=admin_decision_keyboard(
+                booking_id
             ),
         )
 
     except Exception as exc:
-
         logger.exception(
             "Не удалось отправить заявку админу: %s",
             exc,
@@ -1329,11 +1117,9 @@ async def enter_purpose(
 async def approve_booking(
     callback: CallbackQuery,
 ):
-
     if not is_admin(
         callback.from_user.id
     ):
-
         await callback.answer(
             "Нет прав.",
             show_alert=True,
@@ -1348,12 +1134,9 @@ async def approve_booking(
         )[1]
     )
 
-    booking = get_booking(
-        booking_id
-    )
+    booking = get_booking(booking_id)
 
     if booking is None:
-
         await callback.answer(
             "Заявка не найдена.",
             show_alert=True,
@@ -1362,7 +1145,6 @@ async def approve_booking(
         return
 
     if booking["status"] != "pending":
-
         await callback.answer(
             "Заявка уже обработана.",
             show_alert=True,
@@ -1370,19 +1152,24 @@ async def approve_booking(
 
         return
 
-    # Меняем статус
+    # ========================================================
+    # ПОДТВЕРЖДАЕМ БРОНЬ
+    # ========================================================
+
     set_booking_status(
         booking_id,
         "approved",
     )
 
     await callback.answer(
-        "Подтверждено."
+        "Запись подтверждена."
     )
 
-    # Обновляем сообщение админу
-    try:
+    # ========================================================
+    # ОБНОВЛЯЕМ СООБЩЕНИЕ АДМИНА
+    # ========================================================
 
+    try:
         await callback.message.edit_text(
             callback.message.text
             + "\n\n"
@@ -1392,24 +1179,30 @@ async def approve_booking(
     except TelegramBadRequest:
         pass
 
-    # Уведомляем пользователя
+    # ========================================================
+    # ФОРМИРУЕМ ДАННЫЕ
+    # ========================================================
+
     date_ru = format_date_ru(
         booking["date"]
     )
 
-    try:
+    time_start = booking["time_start"]
+    time_end = booking["time_end"]
 
+    # ========================================================
+    # УВЕДОМЛЯЕМ ПОЛЬЗОВАТЕЛЯ
+    # ========================================================
+
+    try:
         await callback.bot.send_message(
             chat_id=booking["user_id"],
             text=(
                 "РЕПЕТИЦИЯ ПОДТВЕРЖДЕНА\n\n"
                 f"Дата: {date_ru}\n"
-                f"Время: "
-                f"{booking['time_start']}"
-                f"–"
-                f"{booking['time_end']}\n"
-                f"Людей: "
-                f"{booking['people_count']}"
+                f"Время: {time_start}–{time_end}\n"
+                f"Людей: {booking['people_count']}\n\n"
+                "Ваша запись подтверждена."
             ),
         )
 
@@ -1417,35 +1210,66 @@ async def approve_booking(
         TelegramBadRequest,
         TelegramForbiddenError,
     ) as exc:
-
         logger.warning(
-            "Не удалось уведомить пользователя: %s",
+            "Не удалось уведомить пользователя %s: %s",
+            booking["user_id"],
             exc,
         )
 
     # ========================================================
     # ГЛАВНОЕ:
-    # ПУБЛИКАЦИЯ ВО ВСЕ ЗАРЕГИСТРИРОВАННЫЕ ГРУППЫ
+    # ПУБЛИКАЦИЯ В ГРУППЫ И КАНАЛЫ
     # ========================================================
 
     announcement_text = (
-        "РЕПЕТИЦИЯ СОСТОИТСЯ\n\n"
-        f"Дата: {date_ru}\n"
-        f"Время: "
-        f"{booking['time_start']}"
-        f"–"
-        f"{booking['time_end']}\n"
-        f"Количество: "
-        f"{booking['people_count']} человек\n"
-        f"Цель: "
-        f"{booking['purpose']}\n\n"
-        "Reza"
+        "📢 АУДИТОРИЯ ЗАНЯТА\n\n"
+        f"📅 Дата: {date_ru}\n"
+        f"⏰ Время: {time_start}–{time_end}\n"
+        f"👥 Количество: {booking['people_count']} человек\n"
+        f"👤 Имя: {booking['name']}\n"
+        f"📞 Контакт: {booking['contact']}\n"
+        f"🎭 Цель: {booking['purpose']}\n\n"
+        "🔒 Аудитория занята на указанное время."
     )
 
-    await send_announcement_to_all_chats(
+    sent_count = await send_announcement_to_all_chats(
         callback.bot,
         announcement_text,
     )
+
+    # ========================================================
+    # СООБЩЕНИЕ АДМИНУ О РЕЗУЛЬТАТЕ ПУБЛИКАЦИИ
+    # ========================================================
+
+    chats = get_announcement_chats()
+
+    if chats:
+        logger.info(
+            "После подтверждения публикация выполнена. "
+            "Зарегистрированных чатов осталось: %s. "
+            "Успешных отправок: %s.",
+            len(chats),
+            sent_count,
+        )
+    else:
+        logger.warning(
+            "После подтверждения НЕТ зарегистрированных "
+            "групп/каналов."
+        )
+
+        try:
+            await callback.bot.send_message(
+                chat_id=ADMIN_USER_ID,
+                text=(
+                    "⚠️ Запись подтверждена, "
+                    "но групп/каналов для публикации не найдено.\n\n"
+                    "Добавьте бота в группу/канал и выполните "
+                    "там /register."
+                ),
+            )
+
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -1458,11 +1282,9 @@ async def approve_booking(
 async def reject_booking(
     callback: CallbackQuery,
 ):
-
     if not is_admin(
         callback.from_user.id
     ):
-
         await callback.answer(
             "Нет прав.",
             show_alert=True,
@@ -1477,12 +1299,9 @@ async def reject_booking(
         )[1]
     )
 
-    booking = get_booking(
-        booking_id
-    )
+    booking = get_booking(booking_id)
 
     if booking is None:
-
         await callback.answer(
             "Заявка не найдена.",
             show_alert=True,
@@ -1491,7 +1310,6 @@ async def reject_booking(
         return
 
     if booking["status"] != "pending":
-
         await callback.answer(
             "Заявка уже обработана.",
             show_alert=True,
@@ -1509,7 +1327,6 @@ async def reject_booking(
     )
 
     try:
-
         await callback.message.edit_text(
             callback.message.text
             + "\n\n"
@@ -1520,16 +1337,13 @@ async def reject_booking(
         pass
 
     try:
-
         await callback.bot.send_message(
             chat_id=booking["user_id"],
             text=(
                 "Бронирование отклонено.\n\n"
-                f"Дата: "
-                f"{format_date_ru(booking['date'])}\n"
+                f"Дата: {format_date_ru(booking['date'])}\n"
                 f"Время: "
-                f"{booking['time_start']}"
-                f"–"
+                f"{booking['time_start']}–"
                 f"{booking['time_end']}"
             ),
         )
@@ -1538,8 +1352,185 @@ async def reject_booking(
         TelegramBadRequest,
         TelegramForbiddenError,
     ):
-
         pass
+
+
+# ============================================================
+# /CHATS
+# ============================================================
+
+@router.message(
+    Command("chats")
+)
+async def chats_command(
+    message: Message,
+):
+    if not is_admin(
+        message.from_user.id
+    ):
+        await message.answer(
+            "Нет прав администратора."
+        )
+
+        return
+
+    chats = get_announcement_chats()
+
+    if not chats:
+        await message.answer(
+            "Зарегистрированных групп и каналов нет."
+        )
+
+        return
+
+    text = (
+        f"ЗАРЕГИСТРИРОВАННЫЕ ЧАТЫ: {len(chats)}\n\n"
+    )
+
+    for index, chat in enumerate(
+        chats,
+        start=1,
+    ):
+        text += (
+            f"{index}. {chat['title'] or 'Без названия'}\n"
+            f"Тип: {chat['chat_type']}\n"
+            f"ID: {chat['chat_id']}\n\n"
+        )
+
+    await message.answer(text)
+
+
+# ============================================================
+# /REGISTER
+# ============================================================
+
+@router.message(
+    Command("register")
+)
+async def register_command(
+    message: Message,
+):
+    if not is_admin(
+        message.from_user.id
+    ):
+        await message.answer(
+            "Нет прав администратора."
+        )
+
+        return
+
+    if message.chat.type not in (
+        "group",
+        "supergroup",
+        "channel",
+    ):
+        await message.answer(
+            "Эту команду нужно использовать "
+            "в группе или канале, куда бот должен "
+            "отправлять подтверждённые записи."
+        )
+
+        return
+
+    save_announcement_chat(
+        chat_id=message.chat.id,
+        chat_type=message.chat.type,
+        title=message.chat.title or "",
+    )
+
+    await message.answer(
+        "✅ Этот чат зарегистрирован.\n\n"
+        "Теперь после подтверждения записи "
+        "информация об аудитории будет "
+        "отправляться сюда."
+    )
+
+
+# ============================================================
+# /REZA
+# ============================================================
+
+@router.message(
+    Command("reza")
+)
+async def reza_command(
+    message: Message,
+):
+    user_id = (
+        message.from_user.id
+        if message.from_user
+        else None
+    )
+
+    if not is_admin(user_id):
+        await message.answer(
+            "У вас нет прав администратора."
+        )
+
+        return
+
+    # Если команда используется в группе,
+    # автоматически регистрируем группу.
+    if message.chat.type in (
+        "group",
+        "supergroup",
+        "channel",
+    ):
+        save_announcement_chat(
+            chat_id=message.chat.id,
+            chat_type=message.chat.type,
+            title=message.chat.title or "",
+        )
+
+    text = message.text or ""
+
+    parts = text.split(
+        maxsplit=1
+    )
+
+    if len(parts) < 2:
+        await message.answer(
+            "Использование:\n\n"
+            "/reza Текст сообщения"
+        )
+
+        return
+
+    reza_text = parts[1].strip()
+
+    if not reza_text:
+        await message.answer(
+            "После /reza нужно написать текст."
+        )
+
+        return
+
+    try:
+        await message.bot.send_message(
+            chat_id=message.chat.id,
+            text=reza_text,
+        )
+
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+    except TelegramForbiddenError:
+        await message.answer(
+            "Бот не имеет права отправлять "
+            "сообщения в этот чат."
+        )
+
+    except TelegramBadRequest as exc:
+        logger.error(
+            "/reza error: %s",
+            exc,
+        )
+
+        await message.answer(
+            "Не удалось отправить сообщение."
+        )
 
 
 # ============================================================
@@ -1552,11 +1543,9 @@ async def reject_booking(
 async def rv_command(
     message: Message,
 ):
-
     if not is_admin(
         message.from_user.id
     ):
-
         await message.answer(
             "Нет прав администратора."
         )
@@ -1566,7 +1555,6 @@ async def rv_command(
     bookings = get_active_bookings()
 
     if not bookings:
-
         await message.answer(
             "Активных бронирований нет."
         )
@@ -1574,41 +1562,30 @@ async def rv_command(
         return
 
     await message.answer(
-        f"АКТИВНЫЕ БРОНИРОВАНИЯ: "
-        f"{len(bookings)}"
+        f"АКТИВНЫЕ БРОНИРОВАНИЯ: {len(bookings)}"
     )
 
     for booking in bookings:
-
         status = (
             "ОЖИДАЕТ"
             if booking["status"] == "pending"
-            else
-            "ПОДТВЕРЖДЕНО"
+            else "ПОДТВЕРЖДЕНО"
         )
 
         text = (
             f"Заявка №{booking['id']}\n\n"
-            f"Дата: "
-            f"{format_date_ru(booking['date'])}\n"
+            f"Дата: {format_date_ru(booking['date'])}\n"
             f"Время: "
-            f"{booking['time_start']}"
-            f"–"
+            f"{booking['time_start']}–"
             f"{booking['time_end']}\n"
-            f"Людей: "
-            f"{booking['people_count']}\n"
-            f"Имя: "
-            f"{booking['name']}\n"
-            f"Контакт: "
-            f"{booking['contact']}\n"
-            f"Цель: "
-            f"{booking['purpose']}\n\n"
+            f"Людей: {booking['people_count']}\n"
+            f"Имя: {booking['name']}\n"
+            f"Контакт: {booking['contact']}\n"
+            f"Цель: {booking['purpose']}\n\n"
             f"Статус: {status}"
         )
 
-        await message.answer(
-            text
-        )
+        await message.answer(text)
 
 
 # ============================================================
@@ -1622,11 +1599,9 @@ async def delete_command(
     message: Message,
     state: FSMContext,
 ):
-
     if not is_admin(
         message.from_user.id
     ):
-
         await message.answer(
             "Нет прав администратора."
         )
@@ -1636,7 +1611,6 @@ async def delete_command(
     bookings = get_active_bookings()
 
     if not bookings:
-
         await message.answer(
             "Активных бронирований нет."
         )
@@ -1649,12 +1623,9 @@ async def delete_command(
 
     await message.answer(
         "ВНИМАНИЕ!\n\n"
-        f"Будет отменено: "
-        f"{len(bookings)} бронирований.\n\n"
+        f"Будет отменено: {len(bookings)} бронирований.\n\n"
         "Продолжить?",
-        reply_markup=(
-            delete_confirm_keyboard()
-        ),
+        reply_markup=delete_confirm_keyboard(),
     )
 
 
@@ -1670,11 +1641,9 @@ async def delete_confirm(
     callback: CallbackQuery,
     state: FSMContext,
 ):
-
     if not is_admin(
         callback.from_user.id
     ):
-
         await callback.answer(
             "Нет прав.",
             show_alert=True,
@@ -1688,11 +1657,8 @@ async def delete_confirm(
 
     bookings = clear_all_active_bookings()
 
-    # Уведомляем пользователей
     for booking in bookings:
-
         try:
-
             await callback.bot.send_message(
                 chat_id=booking["user_id"],
                 text=(
@@ -1706,14 +1672,11 @@ async def delete_confirm(
             TelegramBadRequest,
             TelegramForbiddenError,
         ):
-
             pass
 
     try:
-
         await callback.message.edit_text(
-            f"Удалено бронирований: "
-            f"{len(bookings)}"
+            f"Удалено бронирований: {len(bookings)}"
         )
 
     except TelegramBadRequest:
@@ -1732,13 +1695,11 @@ async def delete_cancel(
     callback: CallbackQuery,
     state: FSMContext,
 ):
-
     await callback.answer()
 
     await state.clear()
 
     try:
-
         await callback.message.edit_text(
             "Удаление отменено."
         )
@@ -1748,11 +1709,28 @@ async def delete_cancel(
 
 
 # ============================================================
+# ОТМЕНА FSM
+# ============================================================
+
+@router.message(
+    Command("cancel")
+)
+async def cancel_command(
+    message: Message,
+    state: FSMContext,
+):
+    await state.clear()
+
+    await message.answer(
+        "Действие отменено."
+    )
+
+
+# ============================================================
 # ЗАПУСК
 # ============================================================
 
 async def main():
-
     init_db()
 
     bot = Bot(
@@ -1763,21 +1741,23 @@ async def main():
         storage=MemoryStorage()
     )
 
-    dp.include_router(
-        router
-    )
+    dp.include_router(router)
 
+    logger.info(
+        "========================================"
+    )
     logger.info(
         "GARANINCI BOT STARTING"
     )
-
     logger.info(
         "Admin ID: %s",
         ADMIN_USER_ID,
     )
-
     logger.info(
-        "Announcement system enabled"
+        "Announcement system: ENABLED"
+    )
+    logger.info(
+        "========================================"
     )
 
     # Для polling
@@ -1785,12 +1765,18 @@ async def main():
         drop_pending_updates=True
     )
 
+    allowed_updates = dp.resolve_used_update_types()
+
+    logger.info(
+        "Allowed updates: %s",
+        allowed_updates,
+    )
+
     await dp.start_polling(
-        bot
+        bot,
+        allowed_updates=allowed_updates,
     )
 
 
 if __name__ == "__main__":
-    asyncio.run(
-        main()
-    )
+    asyncio.run(main())
